@@ -62,9 +62,15 @@ void testSessions() {
         for (unsigned i = 0; i < Session::ladderQuota; ++i) {
             require(ladder.trial.profile == level, "Ladder advanced at the wrong time or to an excluded profile");
             require(ladder.trial.source(2) == ladder.trial.source(ladder.trial.match), "X must play its matching reference");
+            const auto beforePreview = random;
+            const auto next = ladder.previewNext();
+            require(random == beforePreview, "Previewing must not consume a random draw");
             require(ladder.submit(ladder.trial.match), "A first answer should count");
             require(!ladder.submit(1 - ladder.trial.match), "A second answer must not count");
             ladder.advance(Advance::Next);
+            require(ladder.trial.track == next.track && ladder.trial.profile == next.profile &&
+                    ladder.trial.lossless == next.lossless && ladder.trial.match == next.match,
+                    "The preview must match the next trial, including ladder promotion");
         }
     }
     require(ladder.trial.profile == 4 && ladder.answered == 3 * Session::ladderQuota, "Ladder must stay at the hardest level");
@@ -82,8 +88,11 @@ void testSessions() {
         require(trial.track == 0 && trial.source(trial.lossless) == 0, "Reference assignment is inconsistent");
         ++counts[trial.profile == 3];
         pairs[trial.lossless][trial.match] = true;
+        const auto next = shuffled.previewNext();
         shuffled.submit(1 - trial.lossless);
         shuffled.advance(Advance::Next);
+        require(shuffled.trial.profile == next.profile && shuffled.trial.lossless == next.lossless &&
+                shuffled.trial.match == next.match, "The preview must match the random trial");
     }
     require(counts[0] > 50 && counts[1] > 50 && pairs[0][0] && pairs[0][1] && pairs[1][0] && pairs[1][1],
             "Random profile and source assignments lack coverage");
@@ -91,6 +100,41 @@ void testSessions() {
     Session preference(Mode::Preference, Difficulty::Random, {0}, 1, random);
     preference.submit(preference.trial.lossless);
     require(preference.scores[0].correct == 1, "Preference did not record a lossless pick");
+
+    Session practice(Mode::Abx, Difficulty::Ladder, {0, 2}, 1, random, true);
+    for (unsigned i = 0; i < Session::ladderQuota; ++i) {
+        const auto next = practice.previewNext();
+        require(practice.submit(practice.trial.match), "Practice should accept an answer");
+        practice.advance(Advance::Next);
+        require(practice.trial.profile == next.profile, "Practice should prefetch the next Ladder profile");
+    }
+    const auto& practiceScore = practice.scores[0];
+    require(practice.trial.profile == 2 && practiceScore.total == Session::ladderQuota,
+            "Practice answers should count toward Ladder advancement");
+    require(practiceScore.correct == 0 && practiceScore.peakLogEvidence == 0,
+            "Practice answers should not accumulate blind-test evidence");
+
+    Session fixedTrack(Mode::Abx, Difficulty::Ladder, {0, 2}, 3, random, false, false, 2);
+    require(fixedTrack.trial.track == 2 && fixedTrack.previewNext().track == 2,
+            "Disabling shuffle should keep the previous track in a new session and its preview");
+    fixedTrack.advance(Advance::Skip);
+    require(fixedTrack.trial.track == 2 && fixedTrack.skipped == 1, "Skip should keep the track when shuffle is off");
+    fixedTrack.advance(Advance::ChangeSong, 1);
+    require(fixedTrack.trial.track == 1 && fixedTrack.trial.profile == 0 && fixedTrack.replaced == 1,
+            "Choosing another track for an unanswered trial should keep the profile");
+    for (unsigned i = 1; i < Session::ladderQuota; ++i) {
+        fixedTrack.submit(fixedTrack.trial.match);
+        fixedTrack.advance(Advance::Next);
+        require(fixedTrack.trial.track == 1 && fixedTrack.trial.profile == 0, "The chosen track should persist without shuffle");
+    }
+    fixedTrack.submit(fixedTrack.trial.match);
+    fixedTrack.advance(Advance::Next, 0);
+    require(fixedTrack.trial.track == 0 && fixedTrack.trial.profile == 2 && fixedTrack.replaced == 1,
+            "Picking a track for the next trial should respect Ladder promotion and preserve the answered trial");
+    fixedTrack.shuffleTracks = true;
+    require(fixedTrack.previewNext().track != fixedTrack.trial.track, "Turning on shuffle should preview a different track");
+    Session shuffledRestart(Mode::Abx, Difficulty::Random, {0}, 3, random, false, true, 1);
+    require(shuffledRestart.trial.track != 1, "Starting a shuffled session should avoid the previous track");
 }
 
 void testEvidence() {
@@ -247,8 +291,17 @@ void testCodecs() {
     }
     std::stop_source stop;
     stop.request_stop();
+    require(!preencodeMp3(path, profiles[0], stop.get_token()), "Cancelled pre-encoding should return no MP3");
     require(prepareAudio(path, profiles[0], rate, stop.get_token()).error.issue == AudioIssue::Cancelled,
             "Cancelled preparation returned the wrong error");
+    const auto mp3 = preencodeMp3(path, profiles[0]);
+    require(mp3 != nullptr, "Could not pre-encode an MP3");
+    for (const auto& profile : {profiles.front(), profiles.back()}) {
+        const auto onDemand = prepareAudio(path, profile, rate);
+        const auto prefetched = prepareAudio(path, profile, rate, {}, mp3);
+        require(onDemand.audio && prefetched.audio && prefetched.audio->samples == onDemand.audio->samples,
+                "Preparation with a matching or mismatched MP3 must produce the requested audio");
+    }
     fs::path missing = path;
     missing += L".missing";
     require(prepareAudio(missing, profiles[0], rate).error.issue == AudioIssue::TrackMissing, "Missing track returned the wrong error");

@@ -1,3 +1,0 @@
-#include "resource.h"
-
-IDI_GOLDEN_EAR ICON "assets/golden-ear.ico"

@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -65,21 +66,32 @@ public:
     static constexpr unsigned ladderQuota = 12;
 
     Session(Mode mode, Difficulty difficulty, std::vector<std::size_t> enabled,
-            std::size_t trackCount, std::mt19937_64& random)
-        : mode(mode), difficulty(difficulty), enabled(std::move(enabled)), trackCount(trackCount), random(random) {
-        trial = draw(Advance::Next, false);
+            std::size_t trackCount, std::mt19937_64& random, bool practice = false,
+            bool shuffleTracks = true, std::optional<std::size_t> previousTrack = {})
+        : mode(mode), difficulty(difficulty), enabled(std::move(enabled)), trackCount(trackCount), practice(practice),
+          shuffleTracks(shuffleTracks), random(random) {
+        trial = draw(Advance::Next, ladderIndex, random, previousTrack);
     }
 
-    void advance(Advance action) {
+    Trial previewNext() const {
+        auto previewRandom = random;
+        const bool pendingAnswer = trial.response < 0 && trial.profile == enabled[ladderIndex];
+        return draw(Advance::Next, nextLadderIndex(pendingAnswer), previewRandom, trial.track);
+    }
+
+    void advance(Advance action, std::optional<std::size_t> track = {}) {
         if (action == Advance::Skip) ++skipped;
         if (action == Advance::ChangeSong) ++replaced;
-        trial = draw(action, true);
+        if (action == Advance::Next) ladderIndex = nextLadderIndex(0);
+        trial = draw(action, ladderIndex, random, trial.track, track);
     }
 
     bool submit(int side) {
         if (trial.response != -1 || (side != 0 && side != 1)) return false;
         trial.response = side;
-        scores[trial.profile].record(side == trial.answer(mode));
+        auto& score = scores[trial.profile];
+        if (practice) ++score.total;
+        else score.record(side == trial.answer(mode));
         ++answered;
         return true;
     }
@@ -88,6 +100,8 @@ public:
     const Difficulty difficulty;
     const std::vector<std::size_t> enabled;
     const std::size_t trackCount;
+    const bool practice;
+    bool shuffleTracks;
     Trial trial;
     std::array<Score, profiles.size()> scores {};
     unsigned answered = 0;
@@ -98,27 +112,27 @@ private:
     std::size_t ladderIndex = 0;
     std::mt19937_64& random;
 
-    std::size_t choose(std::size_t count) {
-        return std::uniform_int_distribution<std::size_t>(0, count - 1)(random);
+    std::size_t nextLadderIndex(unsigned pendingAnswers) const {
+        if (difficulty == Difficulty::Ladder && ladderIndex + 1 < enabled.size() &&
+            scores[enabled[ladderIndex]].total + pendingAnswers >= ladderQuota) return ladderIndex + 1;
+        return ladderIndex;
     }
 
-    Trial draw(Advance action, bool hasPrevious) {
-        std::size_t track = 0;
-        if (hasPrevious && trackCount > 1) {
-            track = choose(trackCount - 1);
-            track += track >= trial.track;
-        } else if (trackCount > 1) {
-            track = choose(trackCount);
+    Trial draw(Advance action, std::size_t levelIndex, std::mt19937_64& generator,
+               std::optional<std::size_t> previousTrack, std::optional<std::size_t> chosenTrack = {}) const {
+        const auto choose = [&](std::size_t count) {
+            return std::uniform_int_distribution<std::size_t>(0, count - 1)(generator);
+        };
+        std::size_t track = chosenTrack.value_or(previousTrack.value_or(0));
+        if (!chosenTrack && trackCount > 1 && (shuffleTracks || action == Advance::ChangeSong)) {
+            track = choose(trackCount - previousTrack.has_value());
+            if (previousTrack && track >= *previousTrack) ++track;
         }
-        std::size_t level;
+        std::size_t level = enabled[levelIndex];
         if (action == Advance::ChangeSong) {
             level = trial.profile;
         } else if (difficulty == Difficulty::Random) {
             level = enabled[choose(enabled.size())];
-        } else {
-            if (action == Advance::Next && ladderIndex + 1 < enabled.size() &&
-                scores[enabled[ladderIndex]].total >= ladderQuota) ++ladderIndex;
-            level = enabled[ladderIndex];
         }
         return {track, level, static_cast<int>(choose(2)), static_cast<int>(choose(2)), -1};
     }

@@ -7,6 +7,34 @@
 
 namespace fs = std::filesystem;
 
+struct TempFile {
+    fs::path path;
+    TempFile() {
+        const auto directory = fs::temp_directory_path().wstring();
+        wchar_t name[MAX_PATH] {};
+        if (!GetTempFileNameW(directory.c_str(), L"GEA", 0, name)) {
+            throw std::runtime_error("Could not create an audio work file in the Windows temporary directory.");
+        }
+        path = name;
+    }
+    ~TempFile() { DeleteFileW(path.c_str()); }
+    TempFile(const TempFile&) = delete;
+    TempFile& operator=(const TempFile&) = delete;
+};
+
+struct EncodedMp3 {
+    fs::path track;
+    Profile profile;
+    fs::file_time_type modified;
+    TempFile file;
+
+    bool matches(const fs::path& source, const Profile& quality) const {
+        std::error_code error;
+        return track == source && profile.sampleRate == quality.sampleRate && profile.bitrate == quality.bitrate &&
+            fs::last_write_time(source, error) == modified && !error;
+    }
+};
+
 namespace {
 
 class Handle {
@@ -23,19 +51,6 @@ public:
     }
 private:
     HANDLE value;
-};
-
-struct TempFile {
-    fs::path path;
-    TempFile() {
-        const auto directory = fs::temp_directory_path().wstring();
-        wchar_t name[MAX_PATH] {};
-        if (!GetTempFileNameW(directory.c_str(), L"GEA", 0, name)) {
-            throw std::runtime_error("Could not create an audio work file in the Windows temporary directory.");
-        }
-        path = name;
-    }
-    ~TempFile() { DeleteFileW(path.c_str()); }
 };
 
 // Quote an argument using Windows' backslash and double-quote rules.
@@ -168,6 +183,13 @@ AudioError decode(const fs::path& path, int rate, std::vector<float>& samples, s
                      std::to_wstring(rate) + L" -c:a pcm_f32le -f f32le pipe:1", &samples, stop);
 }
 
+AudioError encodeMp3(const fs::path& track, const Profile& profile, const fs::path& output, std::stop_token stop) {
+    const std::wstring arguments = L"-y -i " + quote(track.wstring()) + L" -map 0:a:0 -map_metadata -1 -t 900.01 -ac 2 -ar " +
+        std::to_wstring(profile.sampleRate) + L" -c:a libmp3lame -b:a " + std::to_wstring(profile.bitrate) +
+        L"k -write_xing 1 -f mp3 " + quote(output.wstring());
+    return runFfmpeg(arguments, nullptr, stop);
+}
+
 void matchLevels(PreparedAudio& audio) {
     std::array<double, 2> energy {};
     std::array<float, 2> peak {};
@@ -198,18 +220,31 @@ void matchLevels(PreparedAudio& audio) {
 
 } // namespace
 
-PreparedResult prepareAudio(const fs::path& track, const Profile& profile, int rate, std::stop_token stop) {
+std::shared_ptr<const EncodedMp3> preencodeMp3(const fs::path& track, const Profile& profile, std::stop_token stop) {
+    try {
+        if (stop.stop_requested() || !fs::is_regular_file(track)) return {};
+        auto mp3 = std::make_shared<EncodedMp3>(track, profile, fs::last_write_time(track));
+        if (encodeMp3(track, profile, mp3->file.path, stop) || !mp3->matches(track, profile)) return {};
+        return mp3;
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
+PreparedResult prepareAudio(const fs::path& track, const Profile& profile, int rate, std::stop_token stop,
+                            std::shared_ptr<const EncodedMp3> prefetched) {
     try {
         if (!fs::is_regular_file(track)) return {{}, {AudioIssue::TrackMissing, {}}};
         auto audio = std::make_shared<PreparedAudio>();
         if (auto error = decode(track, rate, audio->samples[0], stop); error) return {{}, std::move(error)};
         if (audio->frames() > static_cast<std::size_t>(rate) * 900) return {{}, {AudioIssue::TrackTooLong, {}}};
-        TempFile mp3;
-        const std::wstring encode = L"-y -i " + quote(track.wstring()) + L" -map 0:a:0 -map_metadata -1 -ac 2 -ar " +
-            std::to_wstring(profile.sampleRate) + L" -c:a libmp3lame -b:a " + std::to_wstring(profile.bitrate) +
-            L"k -write_xing 1 -f mp3 " + quote(mp3.path.wstring());
-        if (auto error = runFfmpeg(encode, nullptr, stop); error) return {{}, std::move(error)};
-        if (auto error = decode(mp3.path, rate, audio->samples[1], stop); error) return {{}, std::move(error)};
+        std::optional<TempFile> mp3;
+        if (!prefetched || !prefetched->matches(track, profile)) {
+            mp3.emplace();
+            if (auto error = encodeMp3(track, profile, mp3->path, stop); error) return {{}, std::move(error)};
+        }
+        const auto& mp3Path = mp3 ? mp3->path : prefetched->file.path;
+        if (auto error = decode(mp3Path, rate, audio->samples[1], stop); error) return {{}, std::move(error)};
         const auto commonSize = std::min(audio->samples[0].size(), audio->samples[1].size());
         if (!commonSize) return {{}, {AudioIssue::Empty, {}}};
         for (auto& samples : audio->samples) samples.resize(commonSize);

@@ -40,8 +40,12 @@ struct PreparedResult {
     AudioError error;
 };
 
+struct EncodedMp3;
+std::shared_ptr<const EncodedMp3> preencodeMp3(const std::filesystem::path& track, const Profile& profile,
+                                              std::stop_token stop = {});
 PreparedResult prepareAudio(const std::filesystem::path& track, const Profile& profile,
-                            int outputRate, std::stop_token stop = {});
+                            int outputRate, std::stop_token stop = {},
+                            std::shared_ptr<const EncodedMp3> prefetched = {});
 
 struct LoopRange {
     std::size_t start;

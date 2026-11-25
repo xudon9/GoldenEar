@@ -23,8 +23,14 @@ The build copies the recordings and their credits into a `tracks` folder next to
 
 1. Start with the bundled recordings or add your own using **Import audio**. In **Repertoire**, choose **Hide bundled tracks** to use only your imports. The app saves this choice, your imported paths, and your test settings in `%LOCALAPPDATA%\GoldenEar\settings.txt`. `GOLDEN_EAR_HOME` overrides that directory.
 2. Choose a test type, select **Random** or **Ladder**, and enable any combination of MP3 profiles. Ladder advances after every twelve scored answers until it reaches the highest enabled level.
-3. Start a session. Use **Play** to begin and the A, B or X buttons to switch while listening. Submit an answer using the separate A/B answer buttons. **Change song** keeps the profile and **Skip** discards the trial. Neither counts as an answer.
-4. Finish whenever you like. Results stay visible until you start another session. Objective modes show per-profile accuracy and an anytime-valid p-value adjusted across the enabled profiles. Preference mode shows how often you preferred the lossless version.
+3. Start a session. Use the play icon below the waveform to begin and the A, B or X buttons to switch while listening. The curved arrows jump backward or forward five seconds. Submit an answer using the separate A/B answer buttons. Open **Repertoire** or **Change song** to choose a track. Before an answer, this replaces the trial at the same quality. After an answer, it opens the next trial with the track you chose. **Skip** discards the unanswered trial.
+4. **Finish and restart** starts a fresh session with the same settings and resets the results. To finish and keep the results on screen, turn off **Restart after finishing** in **Preferences → Session**. Objective modes show per-profile accuracy and an anytime-valid p-value adjusted across the enabled profiles. Preference mode shows how often you preferred the lossless version.
+
+**Shuffle tracks** in **Preferences → Session** selects a different track for new trials when several are available. Turn it off to keep the current track until you choose another one.
+
+While you listen, Golden Ear encodes the next trial’s MP3 in the background. When you advance, it uses that MP3 to prepare playback.
+
+For a guided comparison, turn on **Practice mode** below the MP3 profiles before starting a session. Each sample shows **Lossless source** or its MP3 sample rate and bitrate, including X in ABX. Practice results show how many questions you answered at each quality.
 
 ## Repeat a clip
 
@@ -36,7 +42,7 @@ Drag across the waveform to select a passage. You can also place the playhead at
 | --- | --- |
 | J / K / L | Listen to A / B / X |
 | `;` | Toggle A/B |
-| Space | Play or pause |
+| Space | Play or pause. After answering, start playing the next trial |
 | `,` / `.` | Seek backward / forward five seconds |
 | 1 / 2 | Submit A / B |
 

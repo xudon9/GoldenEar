@@ -7,11 +7,14 @@
 #include <shlobj.h>
 #include <windowsx.h>
 
+#include <chrono>
 #include <cwctype>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <optional>
 #include <string_view>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -22,7 +25,7 @@ constexpr int height = 740;
 
 struct Palette {
     COLORREF background, surface, raised, hovered, line;
-    COLORREF textColor, muted, disabled, accent, errorColor;
+    COLORREF textColor, muted, disabled, accent, successColor, errorColor;
     COLORREF primary, primaryHover, primaryText;
     COLORREF selected, selectedHover, selectedBorder, selectedText;
     COLORREF waveform, clipWaveform;
@@ -30,7 +33,7 @@ struct Palette {
 
 constexpr Palette lightColors {
     RGB(243, 243, 243), RGB(253, 253, 253), RGB(248, 248, 248), RGB(235, 235, 235), RGB(208, 208, 208),
-    RGB(26, 26, 26), RGB(82, 82, 82), RGB(113, 113, 113), RGB(0, 90, 158), RGB(161, 38, 26),
+    RGB(26, 26, 26), RGB(82, 82, 82), RGB(113, 113, 113), RGB(0, 90, 158), RGB(16, 112, 61), RGB(161, 38, 26),
     RGB(0, 103, 192), RGB(0, 86, 160), RGB(255, 255, 255),
     RGB(229, 241, 251), RGB(217, 234, 248), RGB(97, 149, 189), RGB(0, 76, 135),
     RGB(109, 109, 109), RGB(59, 115, 158)
@@ -38,7 +41,7 @@ constexpr Palette lightColors {
 
 constexpr Palette darkColors {
     RGB(32, 32, 32), RGB(39, 39, 39), RGB(48, 48, 48), RGB(60, 60, 60), RGB(80, 80, 80),
-    RGB(246, 246, 246), RGB(187, 187, 187), RGB(139, 139, 139), RGB(153, 215, 255), RGB(255, 177, 158),
+    RGB(246, 246, 246), RGB(187, 187, 187), RGB(139, 139, 139), RGB(153, 215, 255), RGB(128, 222, 153), RGB(255, 177, 158),
     RGB(153, 215, 255), RGB(177, 225, 255), RGB(0, 42, 69),
     RGB(27, 58, 81), RGB(34, 71, 98), RGB(113, 167, 206), RGB(173, 222, 255),
     RGB(140, 140, 140), RGB(117, 177, 218)
@@ -51,7 +54,7 @@ Palette contrastColors() {
     const auto highlight = GetSysColor(COLOR_HIGHLIGHT);
     const auto highlightedText = GetSysColor(COLOR_HIGHLIGHTTEXT);
     return {window, window, face, face, GetSysColor(COLOR_BTNTEXT),
-            text, text, GetSysColor(COLOR_GRAYTEXT), text, text,
+            text, text, GetSysColor(COLOR_GRAYTEXT), text, text, text,
             highlight, highlight, highlightedText,
             highlight, highlight, text, highlightedText, text, highlightedText};
 }
@@ -76,16 +79,19 @@ constexpr std::array modeNames {Text::Abx, Text::Identify, Text::Preference};
 enum Control {
     Library = 1, Preferences, Import, Start, Finish, Skip, Change, Next, Retry, Seek,
     PlayPause, Rewind, FastForward, SelectA, SelectB, SelectX, Toggle, SubmitA, SubmitB,
-    PreviousPage, NextPage, ClosePanel, ResetKeys, ToggleBundled, MarkLoop, ClearLoop,
+    PreviousPage, NextPage, ClosePanel, ResetKeys, ToggleBundled, MarkLoop, ClearLoop, NextAndPlay, TogglePractice,
     PreferenceBase = 30, ModeBase = 40, DifficultyBase = 50, ProfileBase = 60, KeyBase = 70,
-    ThemeBase = 80, LanguageBase = 90, RemoveBase = 100
+    ThemeBase = 80, LanguageBase = 90, RemoveBase = 100,
+    RestartOnFinishOption = 110, ShuffleTracksOption, PickTrackBase = 120
 };
 
 enum class Panel { Main, Library, Preferences };
-enum class PreferencePage { Appearance, Language, Shortcuts };
+enum class PreferencePage { Appearance, Language, Shortcuts, Session };
+constexpr std::array preferencePages {Text::Appearance, Text::Language, Text::Shortcuts, Text::SessionOptions};
 enum class ThemeSetting { System, Light, Dark };
 enum class Font { Small, Body, Bold, Title, Hero, Sample, Mono, Chinese, Count };
 enum class Style { Normal, Primary, Selected, Quiet };
+enum class TransportIcon { Play, Pause, Rewind, FastForward };
 
 struct Hit {
     int id;
@@ -187,6 +193,9 @@ struct Settings {
     LanguageSetting language = LanguageSetting::Auto;
     ThemeSetting theme = ThemeSetting::System;
     bool includeBundled = true;
+    bool practice = false;
+    bool restartOnFinish = true;
+    bool shuffleTracks = true;
     fs::path file;
 
     void load() {
@@ -206,7 +215,9 @@ struct Settings {
         std::ifstream in(file);
         std::string version;
         if (!(in >> version)) return;
-        const bool hasTheme = version == "GoldenEar4";
+        const bool hasSessionOptions = version == "GoldenEar6";
+        const bool hasPractice = hasSessionOptions || version == "GoldenEar5";
+        const bool hasTheme = hasPractice || version == "GoldenEar4";
         if (!hasTheme && version != "GoldenEar3" && version != "GoldenEar2" && version != "GoldenEar1") return;
         int savedMode = 0;
         int savedDifficulty = 0;
@@ -230,6 +241,8 @@ struct Settings {
             if (!(in >> savedTheme)) return;
             if (savedTheme >= 0 && savedTheme <= static_cast<int>(ThemeSetting::Dark)) theme = static_cast<ThemeSetting>(savedTheme);
         }
+        if (hasPractice && !(in >> practice)) return;
+        if (hasSessionOptions && !(in >> restartOnFinish >> shuffleTracks)) return;
         auto savedKeys = keys;
         std::vector<int> read;
         for (auto& key : savedKeys) {
@@ -254,8 +267,9 @@ struct Settings {
         auto temp = file;
         temp += L".new";
         std::ofstream out(temp, std::ios::trunc);
-        out << "GoldenEar4\n" << static_cast<int>(mode) << ' ' << static_cast<int>(difficulty) << ' ' << enabled
-            << ' ' << languageCode(language) << ' ' << includeBundled << ' ' << static_cast<int>(theme) << '\n';
+        out << "GoldenEar6\n" << static_cast<int>(mode) << ' ' << static_cast<int>(difficulty) << ' ' << enabled
+            << ' ' << languageCode(language) << ' ' << includeBundled << ' ' << static_cast<int>(theme) << ' ' << practice
+            << ' ' << restartOnFinish << ' ' << shuffleTracks << '\n';
         for (int key : keys) out << key << ' ';
         out << '\n';
         for (const auto& path : tracks) {
@@ -307,6 +321,64 @@ public:
         LineTo(dc, x2, y2);
     }
 
+    void answerMark(RECT area, bool correct) const {
+        const auto ink = correct ? colors.successColor : colors.errorColor;
+        box(area, colors.surface, ink, 16);
+        const int x = (area.left + area.right) / 2;
+        const int y = (area.top + area.bottom) / 2;
+        const auto pen = CreatePen(PS_SOLID, 3, ink);
+        const auto previous = pen ? SelectObject(dc, pen) : nullptr;
+        if (correct) {
+            const POINT check[] {{x - 7, y}, {x - 2, y + 5}, {x + 7, y - 5}};
+            Polyline(dc, check, static_cast<int>(std::size(check)));
+        } else {
+            const POINT down[] {{x - 5, y - 5}, {x + 5, y + 5}};
+            const POINT up[] {{x - 5, y + 5}, {x + 5, y - 5}};
+            Polyline(dc, down, static_cast<int>(std::size(down)));
+            Polyline(dc, up, static_cast<int>(std::size(up)));
+        }
+        if (pen) {
+            SelectObject(dc, previous);
+            DeleteObject(pen);
+        }
+    }
+
+    void transportIcon(TransportIcon icon, RECT area, COLORREF color) const {
+        const int x = (area.left + area.right) / 2;
+        const int y = (area.top + area.bottom) / 2;
+        if (icon == TransportIcon::Pause) {
+            box(rect(x - 7, y - 9, 5, 18), color, color, 1);
+            box(rect(x + 2, y - 9, 5, 18), color, color, 1);
+            return;
+        }
+        SetDCBrushColor(dc, color);
+        SetDCPenColor(dc, color);
+        if (icon == TransportIcon::Play) {
+            const POINT triangle[] {{x - 5, y - 9}, {x + 9, y}, {x - 5, y + 9}};
+            Polygon(dc, triangle, static_cast<int>(std::size(triangle)));
+            return;
+        }
+
+        const int direction = icon == TransportIcon::Rewind ? -1 : 1;
+        const auto point = [&](int dx, int dy) -> POINT { return {x + direction * dx, y + dy}; };
+        const POINT curve[] {
+            point(10, -3), point(12, 3), point(8, 11), point(0, 11),
+            point(-7, 11), point(-11, 6), point(-11, 0),
+            point(-11, -6), point(-6, -10), point(1, -10)
+        };
+        if (const auto pen = CreatePen(PS_SOLID, 2, color)) {
+            const auto previous = SelectObject(dc, pen);
+            PolyBezier(dc, curve, static_cast<DWORD>(std::size(curve)));
+            SelectObject(dc, previous);
+            DeleteObject(pen);
+        } else {
+            PolyBezier(dc, curve, static_cast<DWORD>(std::size(curve)));
+        }
+        const POINT arrow[] {point(6, -10), point(0, -14), point(0, -6)};
+        Polygon(dc, arrow, static_cast<int>(std::size(arrow)));
+        label(L"5", rect(x - 7, y - 7, 14, 16), Font::Small, color, DT_CENTER);
+    }
+
     void label(std::wstring_view value, RECT area, Font font, std::optional<COLORREF> color = {}, UINT align = DT_LEFT) const {
         SelectObject(dc, fonts[static_cast<std::size_t>(font)]);
         SetTextColor(dc, color.value_or(colors.textColor));
@@ -333,6 +405,13 @@ public:
     int run(HINSTANCE instance, int show);
 
 private:
+    struct Mp3Preparation {
+        std::size_t track;
+        std::size_t profile;
+        std::future<std::shared_ptr<const EncodedMp3>> encoded;
+        std::jthread worker;
+    };
+
     static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT message(UINT message, WPARAM wParam, LPARAM lParam);
     void paint();
@@ -345,8 +424,10 @@ private:
     void appearance(Canvas& canvas);
     void shortcuts(Canvas& canvas);
     void languages(Canvas& canvas);
+    void sessionOptions(Canvas& canvas);
     void button(Canvas& canvas, int id, RECT area, std::wstring_view label, Style style = Style::Normal,
                 bool enabled = true, Font font = Font::Bold);
+    COLORREF buttonFace(Canvas& canvas, int id, RECT area, Style style, bool enabled);
     void sample(Canvas& canvas, int side, RECT area);
     void transport(Canvas& canvas, Player::State state);
     void updateLanguage();
@@ -361,10 +442,14 @@ private:
     void importTracks();
     std::size_t bundledTrackCount() const { return settings.includeBundled ? bundledTracks.size() : 0; }
     std::size_t trackCount() const { return bundledTrackCount() + settings.tracks.size(); }
+    const fs::path& trackPath(std::size_t index) const;
     void start();
-    void prepare();
+    void advanceTrial(Advance action, bool autoplay = false, std::optional<std::size_t> track = {});
+    void prepare(bool autoplay = false);
+    void prefetchNextMp3();
     void poll();
     void finish();
+    void selectTrack(std::size_t index);
     void choose(int side);
     void movePlayhead(long long frame);
     std::size_t timelineFrame(int x) const;
@@ -381,11 +466,13 @@ private:
     Player player;
     std::mt19937_64 random {std::random_device{}()};
     std::optional<Session> session;
+    fs::path lastTrack;
     Panel panel = Panel::Main;
     PreferencePage preferencePage = PreferencePage::Appearance;
     std::shared_ptr<PreparedAudio> audio;
     std::mutex resultMutex;
     std::optional<PreparedResult> prepared;
+    std::optional<Mp3Preparation> nextMp3;
     std::jthread preparation;
     std::vector<Hit> hits;
     AudioError error;
@@ -399,15 +486,20 @@ private:
     int dragCurrentX = 0;
     int capturing = -1;
     std::size_t page = 0;
+    std::optional<std::size_t> requestedTrack;
     std::optional<LoopRange> clip;
     std::optional<std::size_t> loopStart;
     bool active = false;
+    bool restartPending = false;
+    bool playWhenPrepared = false;
     bool tracking = false;
     bool dirty = true;
     bool wasPlaying = false;
 
     static constexpr std::size_t pageSize = 8;
-    static constexpr RECT seekArea = rect(66, 393, 652, 55);
+    static constexpr int timelineStart = 82;
+    static constexpr int timelineEnd = 702;
+    static constexpr RECT seekArea = rect(timelineStart - 5, 398, timelineEnd - timelineStart + 11, 51);
 };
 
 App::App() {
@@ -465,6 +557,13 @@ App::~App() {
 }
 
 void App::button(Canvas& canvas, int id, RECT area, std::wstring_view label, Style style, bool enabled, Font font) {
+    const auto ink = buttonFace(canvas, id, area, style, enabled);
+    area.left += 5;
+    area.right -= 5;
+    canvas.label(label, area, font, ink, DT_CENTER);
+}
+
+COLORREF App::buttonFace(Canvas& canvas, int id, RECT area, Style style, bool enabled) {
     const bool hot = enabled && PtInRect(&area, pointer);
     COLORREF fill = hot ? colors.hovered : colors.raised;
     COLORREF border = colors.line;
@@ -483,9 +582,7 @@ void App::button(Canvas& canvas, int id, RECT area, std::wstring_view label, Sty
     if (enabled && focused == id) border = colors.textColor;
     if (enabled) hits.push_back({id, area});
     canvas.box(area, fill, border, 8);
-    area.left += 5;
-    area.right -= 5;
-    canvas.label(label, area, font, ink, DT_CENTER);
+    return ink;
 }
 
 std::wstring App::profileLabel(std::size_t index) const {
@@ -541,37 +638,50 @@ void App::setup(Canvas& canvas) {
                selected ? Style::Selected : Style::Normal);
         canvas.label(locale.sampleRate(profiles[i].sampleRate), rect(x, 521, 124, 18), Font::Small, colors.muted, DT_CENTER);
     }
-    canvas.stroke(65, 565, 717, 565, colors.line);
+    button(canvas, TogglePractice, rect(65, 548, 252, 37), t(settings.practice ? Text::PracticeOn : Text::PracticeOff),
+           settings.practice ? Style::Selected : Style::Normal);
+    canvas.label(t(Text::PracticeHelp), rect(329, 548, 388, 37), Font::Small, colors.muted);
+    canvas.stroke(65, 600, 717, 600, colors.line);
     const auto tracks = trackCount();
     const auto trackStatus = tracks == 0 ? std::wstring(t(Text::AddAudioToBegin)) : locale.format(tracks == 1 ? Text::TrackReady : Text::TracksReady, tracks);
-    canvas.label(trackStatus, rect(65, 589, 282, 47), Font::Body, colors.muted);
-    button(canvas, Import, rect(365, 589, 151, 47), t(Text::ImportAudio));
-    button(canvas, Start, rect(526, 589, 191, 47), t(Text::StartSession), Style::Primary, tracks != 0 && !preparation.joinable());
+    canvas.label(trackStatus, rect(65, 614, 282, 47), Font::Body, colors.muted);
+    button(canvas, Import, rect(365, 614, 151, 47), t(Text::ImportAudio));
+    button(canvas, Start, rect(526, 614, 191, 47), t(Text::StartSession), Style::Primary,
+           tracks != 0 && !preparation.joinable() && !nextMp3);
 }
 
 void App::results(Canvas& canvas) {
     canvas.label(t(Text::SessionResults), rect(785, 132, 334, 37), Font::Title);
+    const bool practice = session ? session->practice : settings.practice;
     if (session) {
         const auto& s = *session;
-        std::wstring meta(t(modeNames[static_cast<std::size_t>(s.mode)]));
+        std::wstring meta(t(practice ? Text::PracticeMode : modeNames[static_cast<std::size_t>(s.mode)]));
         meta.append(L"  /  ").append(t(s.difficulty == Difficulty::Random ? Text::Random : Text::Ladder));
         meta.append(L"  /  ").append(t(active ? Text::InProgress : Text::Finished));
         canvas.label(meta, rect(787, 174, 330, 26), Font::Small, colors.muted);
     } else {
-        canvas.label(t(Text::NoScores), rect(787, 174, 330, 26), Font::Small, colors.muted);
+        canvas.label(t(practice ? Text::PracticeMode : Text::NoScores), rect(787, 174, 330, 26), Font::Small, colors.muted);
     }
     const bool preference = session ? session->mode == Mode::Preference : settings.mode == Mode::Preference;
     canvas.stroke(787, 215, 1116, 215, colors.line);
     canvas.label(t(Text::ProfileColumn), rect(787, 227, 150, 23), Font::Small, colors.muted);
-    canvas.label(t(preference ? Text::PreferenceColumn : Text::CorrectColumn), rect(933, 227, 81, 23), Font::Small, colors.muted, DT_CENTER);
-    canvas.label(t(preference ? Text::ShareColumn : Text::PValueColumn), rect(1016, 227, 100, 23), Font::Small, colors.muted, DT_RIGHT);
+    if (practice) {
+        canvas.label(t(Text::AnswersColumn), rect(1016, 227, 100, 23), Font::Small, colors.muted, DT_RIGHT);
+    } else {
+        canvas.label(t(preference ? Text::PreferenceColumn : Text::CorrectColumn), rect(933, 227, 81, 23), Font::Small, colors.muted, DT_CENTER);
+        canvas.label(t(preference ? Text::ShareColumn : Text::PValueColumn), rect(1016, 227, 100, 23), Font::Small, colors.muted, DT_RIGHT);
+    }
     int y = 254;
     for (std::size_t i = 0; i < profiles.size(); ++i) {
         if (session && std::find(session->enabled.begin(), session->enabled.end(), i) == session->enabled.end()) continue;
         if (!session && (settings.enabled & (1U << i)) == 0) continue;
         canvas.stroke(787, y, 1116, y, colors.line);
         canvas.label(profileLabel(i), rect(787, y + 4, 150, 30), Font::Body);
-        if (session && session->scores[i].total) {
+        if (practice) {
+            const auto total = session ? session->scores[i].total : 0;
+            canvas.label(total ? std::to_wstring(total) : L"—", rect(1016, y + 4, 100, 30), Font::Mono,
+                         total ? colors.textColor : colors.muted, DT_RIGHT);
+        } else if (session && session->scores[i].total) {
             const auto& score = session->scores[i];
             const double p = score.adjustedP(session->enabled.size());
             canvas.label(std::to_wstring(score.correct) + L" / " + std::to_wstring(score.total), rect(933, y + 2, 81, 27), Font::Mono, colors.textColor, DT_CENTER);
@@ -592,9 +702,10 @@ void App::results(Canvas& canvas) {
         const auto counts = locale.format(Text::TrialCounts, s.answered, s.skipped, s.replaced);
         canvas.label(counts, rect(787, 517, 330, 24), Font::Small, colors.muted);
     }
-    canvas.paragraph(t(preference ? Text::PreferenceHelp : Text::PValueHelp),
-        rect(787, 551, 330, 46), Font::Small);
-    if (active) button(canvas, Finish, rect(787, 613, 330, 43), t(Text::FinishSession), Style::Quiet);
+    if (!practice) canvas.paragraph(t(preference ? Text::PreferenceHelp : Text::PValueHelp),
+                                   rect(787, 551, 330, 46), Font::Small);
+    if (active) button(canvas, Finish, rect(787, 613, 330, 43),
+                       t(settings.restartOnFinish ? Text::FinishAndRestart : Text::FinishSession), Style::Quiet);
 }
 
 void App::sample(Canvas& canvas, int side, RECT area) {
@@ -612,62 +723,102 @@ void App::sample(Canvas& canvas, int side, RECT area) {
     const int keyX = area.right - keyWidth - 14;
     canvas.box(rect(keyX, area.top + 16, keyWidth, 24), on ? colors.selected : colors.surface, border, 6);
     canvas.label(key, rect(keyX + 3, area.top + 16, keyWidth - 6, 23), Font::Small, on ? colors.selectedText : colors.muted, DT_CENTER);
-    canvas.label(t(on ? Text::Selected : side == 2 ? Text::UnknownSample : Text::ReferenceSample), rect(area.left + 19, area.top + 73, area.right - area.left - 37, 25),
-                 Font::Small, on ? colors.selectedText : colors.muted);
+    std::wstring label(t(on ? Text::Selected : side == 2 ? Text::UnknownSample : Text::ReferenceSample));
+    const auto& trial = session->trial;
+    if (session->practice) {
+        label = trial.source(side) == 0 ? std::wstring(t(Text::LosslessSource)) : L"MP3  ·  " + profileLabel(trial.profile);
+    }
+    canvas.label(label, rect(area.left + 19, area.top + 73, area.right - area.left - 37, 25), Font::Small,
+                 on ? colors.selectedText : colors.muted);
+    if (trial.response >= 0 && session->mode != Mode::Preference) {
+        const bool correct = side == trial.answer(session->mode);
+        if (correct || side == trial.response) canvas.answerMark(rect(area.right - 46, area.top + 44, 32, 32), correct);
+    }
 }
 
 void App::transport(Canvas& canvas, Player::State state) {
+    canvas.box(rect(66, 388, 652, 137), colors.raised, colors.line);
     const bool ready = audio != nullptr;
     const auto frameCount = ready ? audio->frames() : 0;
-    const int timelineX = seekArea.left;
-    const int timelineW = seekArea.right - seekArea.left;
+    constexpr int timelineWidth = timelineEnd - timelineStart;
+    constexpr int waveformTop = seekArea.top + 2;
+    constexpr int waveformCenter = seekArea.top + 22;
+    constexpr int progressY = seekArea.bottom - 5;
     const auto positionX = [&](std::size_t frame) {
-        return timelineX + (frameCount ? static_cast<int>(static_cast<double>(frame) * timelineW / frameCount) : 0);
+        return timelineStart + (frameCount ? static_cast<int>(static_cast<double>(frame) * timelineWidth / frameCount) : 0);
     };
     const auto preview = ready && pressed == Seek ? draggedLoop(dragCurrentX) : std::nullopt;
     const auto range = preview ? preview : state.loop;
     const int loopLeft = range ? positionX(range->start) : 0;
     const int loopRight = range ? std::max(loopLeft + 1, positionX(range->end)) : 0;
-    if (range) canvas.box(rect(loopLeft, 396, loopRight - loopLeft, 49), colors.selected, colors.selected, 1);
+    if (range) canvas.box(rect(loopLeft, waveformTop, loopRight - loopLeft, progressY - waveformTop + 3), colors.selected, colors.selected, 1);
     const int playhead = positionX(state.position);
     for (std::size_t i = 0; i < PreparedAudio::overviewSize; ++i) {
-        const int x = timelineX + 2 + static_cast<int>((timelineW - 4) * i / PreparedAudio::overviewSize);
+        const int x = timelineStart + 2 + static_cast<int>((timelineWidth - 4) * i / PreparedAudio::overviewSize);
         const int amplitude = ready ? 2 + static_cast<int>(17 * std::sqrt(audio->overview[i])) : 2;
         const bool inside = range && x >= loopLeft && x <= loopRight;
         const COLORREF waveform = inside ? (x <= playhead ? colors.selectedText : colors.clipWaveform) :
             ready && !range && x <= playhead ? colors.accent : colors.waveform;
-        canvas.stroke(x, 420 - amplitude, x, 421 + amplitude, waveform);
-        canvas.stroke(x + 1, 420 - amplitude, x + 1, 421 + amplitude, waveform);
+        canvas.stroke(x, waveformCenter - amplitude, x, waveformCenter + amplitude + 1, waveform);
+        canvas.stroke(x + 1, waveformCenter - amplitude, x + 1, waveformCenter + amplitude + 1, waveform);
     }
+    canvas.box(rect(timelineStart, progressY - 1, timelineWidth + 1, 3), colors.line, colors.line, 1);
     if (ready) {
         hits.push_back({Seek, seekArea});
         if (range) {
-            canvas.stroke(loopLeft, 396, loopLeft, 445, colors.accent);
-            canvas.stroke(loopRight, 396, loopRight, 445, colors.accent);
+            canvas.stroke(loopLeft, waveformTop, loopLeft, progressY + 3, colors.accent);
+            canvas.stroke(loopRight, waveformTop, loopRight, progressY + 3, colors.accent);
         } else if (loopStart) {
             const int x = positionX(*loopStart);
-            canvas.stroke(x, 396, x, 445, colors.accent);
+            canvas.stroke(x, waveformTop, x, progressY + 3, colors.accent);
         }
-        const auto playheadColor = range && playhead > loopLeft && playhead < loopRight ? colors.selectedText : colors.accent;
-        canvas.stroke(playhead, 396, playhead, 445, playheadColor);
-        if (focused == Seek) canvas.stroke(timelineX, 447, timelineX + timelineW, 447, colors.textColor);
+        const bool insideLoop = range && playhead >= loopLeft && playhead < loopRight;
+        const auto playheadColor = insideLoop ? colors.selectedText : colors.accent;
+        const int progressStart = insideLoop ? loopLeft : timelineStart;
+        if (playhead > progressStart) {
+            canvas.box(rect(progressStart, progressY - 1, playhead - progressStart + 1, 3), playheadColor, playheadColor, 1);
+        }
+        canvas.stroke(playhead, waveformTop, playhead, progressY + 3, playheadColor);
+        if (focused == Seek) canvas.stroke(timelineStart, seekArea.bottom, timelineEnd + 1, seekArea.bottom, colors.textColor);
     }
-    canvas.label(clockText(state.position, player.sampleRate()), rect(66, 449, 75, 20), Font::Mono, colors.muted);
-    canvas.label(clockText(frameCount, player.sampleRate()), rect(643, 449, 75, 20), Font::Mono, colors.muted, DT_RIGHT);
+    canvas.label(clockText(state.position, player.sampleRate()), rect(82, 452, 69, 20), Font::Mono, colors.muted);
+    canvas.label(clockText(frameCount, player.sampleRate()), rect(633, 452, 69, 20), Font::Mono, colors.muted, DT_RIGHT);
     if (ready) {
         const int rate = player.sampleRate();
         const auto loopLabel = range ? locale.format(Text::LoopTimes, clockText(range->start, rate, true), clockText(range->end, rate, true)) :
             loopStart ? locale.format(Text::LoopStartTime, clockText(*loopStart, rate, true)) : std::wstring(t(Text::DragToLoop));
-        canvas.label(loopLabel, rect(151, 449, 482, 20), Font::Small, range || loopStart ? colors.accent : colors.muted, DT_CENTER);
+        canvas.label(loopLabel, rect(151, 452, 482, 20), Font::Small, range || loopStart ? colors.accent : colors.muted, DT_CENTER);
     }
 
-    button(canvas, PlayPause, rect(66, 479, 156, 40), t(state.playing ? Text::Pause : Text::Play), Style::Primary, ready);
-    button(canvas, Rewind, rect(232, 479, 104, 40), t(Text::Rewind), Style::Normal, ready);
-    button(canvas, FastForward, rect(346, 479, 104, 40), t(Text::Forward), Style::Normal, ready);
-    button(canvas, Toggle, rect(575, 479, 143, 40), t(Text::ToggleAB), Style::Quiet, ready);
-    button(canvas, MarkLoop, rect(66, 527, 194, 32), t(loopStart ? Text::SetLoopEnd : Text::SetLoopStart),
+    struct PlaybackButton {
+        Control id;
+        RECT area;
+        TransportIcon icon;
+        Text description;
+    };
+    const PlaybackButton controls[] {
+        {Rewind, rect(306, 475, 48, 40), TransportIcon::Rewind, Text::SeekBack},
+        {PlayPause, rect(368, 473, 48, 44), state.playing ? TransportIcon::Pause : TransportIcon::Play,
+            state.playing ? Text::Pause : Text::Play},
+        {FastForward, rect(430, 475, 48, 40), TransportIcon::FastForward, Text::SeekForward},
+    };
+    const PlaybackButton* hoveredControl = nullptr;
+    const PlaybackButton* focusedControl = nullptr;
+    for (const auto& control : controls) {
+        const auto style = control.id == PlayPause ? Style::Primary : Style::Normal;
+        const auto ink = buttonFace(canvas, control.id, control.area, style, ready);
+        canvas.transportIcon(control.icon, control.area, ink);
+        if (ready && PtInRect(&control.area, pointer)) hoveredControl = &control;
+        if (ready && focused == control.id) focusedControl = &control;
+    }
+    if (const auto* hint = hoveredControl ? hoveredControl : focusedControl) {
+        canvas.label(t(hint->description), rect(490, 475, 212, 40), Font::Small, colors.muted);
+    }
+
+    button(canvas, MarkLoop, rect(66, 532, 224, 31), t(loopStart ? Text::SetLoopEnd : Text::SetLoopStart),
            loopStart ? Style::Selected : Style::Quiet, ready);
-    button(canvas, ClearLoop, rect(270, 527, 140, 32), t(Text::ClearLoop), Style::Quiet, ready && (state.loop || loopStart));
+    button(canvas, ClearLoop, rect(300, 532, 140, 31), t(Text::ClearLoop), Style::Quiet, ready && (state.loop || loopStart));
+    button(canvas, Toggle, rect(575, 532, 143, 31), t(Text::ToggleAB), Style::Quiet, ready);
 }
 
 void App::listening(Canvas& canvas) {
@@ -675,7 +826,8 @@ void App::listening(Canvas& canvas) {
     const auto& trial = s.trial;
     auto meta = locale.format(Text::Trial, s.answered + s.skipped + s.replaced + (trial.response < 0 ? 1 : 0));
     meta.append(L"  /  ").append(t(modeNames[static_cast<std::size_t>(s.mode)]));
-    canvas.label(meta, rect(66, 131, 420, 24), Font::Mono, colors.accent);
+    if (s.practice) meta.append(L"  /  ").append(t(Text::PracticeMode));
+    canvas.label(meta, rect(66, 131, 650, 24), Font::Mono, colors.accent);
     const auto bundledCount = bundledTrackCount();
     const auto title = trial.track < bundledCount ? std::wstring(bundledTracks[trial.track].title)
         : settings.tracks[trial.track - bundledCount].stem().wstring();
@@ -700,16 +852,20 @@ void App::listening(Canvas& canvas) {
 
     if (trial.response >= 0) {
         std::wstring headline;
+        auto feedbackColor = colors.accent;
         if (s.mode == Mode::Preference) {
             headline = locale.format(Text::PreferenceAnswer, sideName(trial.response), sideName(trial.lossless));
         } else {
-            headline = t(trial.response == trial.answer(s.mode) ? Text::Correct : Text::Incorrect);
+            const bool correct = trial.response == trial.answer(s.mode);
+            feedbackColor = correct ? colors.successColor : colors.errorColor;
+            headline = t(correct ? Text::Correct : Text::Incorrect);
             headline += L' ';
             headline += s.mode == Mode::Abx ? locale.format(Text::AbxAnswer, sideName(trial.match), sideName(trial.lossless)) :
                 locale.format(Text::IdentifyAnswer, sideName(trial.lossless));
         }
-        canvas.label(headline, rect(66, 579, 648, 31), Font::Bold, s.mode == Mode::Preference || trial.response == trial.answer(s.mode) ? colors.accent : colors.textColor);
-        canvas.label(L"MP3  ·  " + profileLabel(trial.profile), rect(66, 619, 440, 41), Font::Body, colors.muted);
+        canvas.label(headline, rect(66, 579, 648, 31), Font::Bold, feedbackColor);
+        if (!s.practice) canvas.label(L"MP3  ·  " + profileLabel(trial.profile), rect(66, 619, 290, 41), Font::Body, colors.muted);
+        button(canvas, Change, rect(375, 620, 152, 43), t(Text::ChangeSong), Style::Quiet, s.trackCount > 1);
         button(canvas, Next, rect(537, 620, 181, 43), t(Text::NextTrial), Style::Primary, !preparation.joinable());
         return;
     }
@@ -724,12 +880,12 @@ void App::listening(Canvas& canvas) {
         button(canvas, SubmitB, rect(213, 617, 138, 45), L"B  /  " + keyName(settings.keys[AnswerB], locale), Style::Selected, audio != nullptr);
     }
     button(canvas, Skip, rect(456, 617, 100, 45), t(Text::Skip), Style::Quiet, idle);
-    button(canvas, Change, rect(566, 617, 152, 45), t(Text::ChangeSong), Style::Quiet, idle && s.trackCount > 1);
+    button(canvas, Change, rect(566, 617, 152, 45), t(Text::ChangeSong), Style::Quiet, s.trackCount > 1);
 }
 
 void App::library(Canvas& canvas) {
     canvas.label(t(Text::Repertoire), rect(65, 128, 640, 47), Font::Hero);
-    canvas.label(t(Text::SourceFormats), rect(66, 182, 648, 24), Font::Body, colors.muted);
+    canvas.label(t(active ? Text::ChooseTrackHelp : Text::SourceFormats), rect(66, 182, 648, 24), Font::Body, colors.muted);
     canvas.stroke(66, 224, 718, 224, colors.line);
     const auto count = trackCount();
     const auto bundledCount = bundledTrackCount();
@@ -744,12 +900,20 @@ void App::library(Canvas& canvas) {
             const auto& track = bundledTracks[i];
             canvas.label(track.title, rect(66, y + 2, 489, 22), Font::Bold);
             canvas.label(track.performer, rect(66, y + 22, 489, 17), Font::Small, colors.muted);
-            canvas.label(t(Text::BundledTrack), rect(570, y + 4, 148, 31), Font::Small, colors.muted, DT_RIGHT);
+            if (!active) canvas.label(t(Text::BundledTrack), rect(570, y + 4, 148, 31), Font::Small, colors.muted, DT_RIGHT);
         } else {
             const auto& path = settings.tracks[i - bundledCount];
             canvas.label(path.filename().wstring(), rect(66, y + 2, 489, 22), Font::Bold);
             canvas.label(path.parent_path().wstring(), rect(66, y + 22, 489, 17), Font::Small, colors.muted);
             if (!active) button(canvas, RemoveBase + static_cast<int>(i - first), rect(603, y + 4, 115, 31), t(Text::Remove), Style::Quiet);
+        }
+        if (active) {
+            if (session->trial.track == i) {
+                canvas.label(t(Text::CurrentTrack), rect(570, y + 4, 148, 31), Font::Small, colors.accent, DT_RIGHT);
+            } else {
+                button(canvas, PickTrackBase + static_cast<int>(i - first), rect(603, y + 4, 115, 31),
+                       t(Text::ChooseTrack), Style::Quiet);
+            }
         }
         canvas.stroke(66, y + 41, 718, y + 41, colors.line);
     }
@@ -758,19 +922,18 @@ void App::library(Canvas& canvas) {
         button(canvas, NextPage, rect(175, 575, 100, 33), t(Text::NextPage), Style::Quiet, end < count);
         canvas.label(locale.format(Text::PageRange, first + 1, end, count), rect(288, 575, 158, 33), Font::Small, colors.muted);
     }
-    if (!bundledTracks.empty()) {
+    if (!active && !bundledTracks.empty()) {
         const auto label = settings.includeBundled ? Text::HideBundledTracks : Text::ShowBundledTracks;
-        button(canvas, ToggleBundled, rect(66, 611, 242, 42), t(label), Style::Quiet, !active);
+        button(canvas, ToggleBundled, rect(66, 611, 242, 42), t(label), Style::Quiet);
     }
-    button(canvas, ClosePanel, rect(465, 611, 100, 42), t(Text::Done), Style::Quiet);
-    button(canvas, Import, rect(576, 611, 142, 42), t(Text::ImportAudio), Style::Primary, !active);
+    button(canvas, ClosePanel, rect(active ? 618 : 465, 611, 100, 42), t(Text::Done), active ? Style::Primary : Style::Quiet);
+    if (!active) button(canvas, Import, rect(576, 611, 142, 42), t(Text::ImportAudio), Style::Primary);
 }
 
 void App::preferences(Canvas& canvas) {
     canvas.label(t(Text::Preferences), rect(65, 128, 640, 47), Font::Hero);
-    constexpr std::array pages {Text::Appearance, Text::Language, Text::Shortcuts};
-    for (int i = 0; i < static_cast<int>(pages.size()); ++i) {
-        button(canvas, PreferenceBase + i, rect(66 + i * 220, 187, 212, 40), t(pages[i]),
+    for (int i = 0; i < static_cast<int>(preferencePages.size()); ++i) {
+        button(canvas, PreferenceBase + i, rect(66 + i * 165, 187, 157, 40), t(preferencePages[i]),
                static_cast<int>(preferencePage) == i ? Style::Selected : Style::Quiet);
     }
     canvas.stroke(66, 242, 718, 242, colors.line);
@@ -778,8 +941,21 @@ void App::preferences(Canvas& canvas) {
     case PreferencePage::Appearance: appearance(canvas); break;
     case PreferencePage::Language: languages(canvas); break;
     case PreferencePage::Shortcuts: shortcuts(canvas); break;
+    case PreferencePage::Session: sessionOptions(canvas); break;
     }
     button(canvas, ClosePanel, rect(602, 611, 116, 42), t(Text::Done), Style::Primary);
+}
+
+void App::sessionOptions(Canvas& canvas) {
+    canvas.label(t(Text::RestartOnFinish), rect(66, 270, 490, 28), Font::Bold);
+    canvas.label(t(Text::RestartOnFinishHelp), rect(66, 300, 490, 25), Font::Small, colors.muted);
+    button(canvas, RestartOnFinishOption, rect(578, 277, 140, 40), t(settings.restartOnFinish ? Text::OptionOn : Text::OptionOff),
+           settings.restartOnFinish ? Style::Selected : Style::Normal);
+    canvas.stroke(66, 344, 718, 344, colors.line);
+    canvas.label(t(Text::ShuffleTracks), rect(66, 362, 490, 28), Font::Bold);
+    canvas.label(t(Text::ShuffleTracksHelp), rect(66, 392, 490, 25), Font::Small, colors.muted);
+    button(canvas, ShuffleTracksOption, rect(578, 369, 140, 40), t(settings.shuffleTracks ? Text::OptionOn : Text::OptionOff),
+           settings.shuffleTracks ? Style::Selected : Style::Normal);
 }
 
 void App::appearance(Canvas& canvas) {
@@ -874,21 +1050,46 @@ void App::importTracks() {
     }
 }
 
+const fs::path& App::trackPath(std::size_t index) const {
+    const auto bundledCount = bundledTrackCount();
+    return index < bundledCount ? bundledTracks[index].path : settings.tracks[index - bundledCount];
+}
+
 void App::start() {
-    if (active || !trackCount() || preparation.joinable()) return;
+    if (active || preparation.joinable() || nextMp3) return;
+    restartPending = false;
+    const auto count = trackCount();
+    if (!count) return;
     std::vector<std::size_t> enabled;
     for (std::size_t i = 0; i < profiles.size(); ++i) {
         if (settings.enabled & (1U << i)) enabled.push_back(i);
     }
     if (enabled.empty()) return;
-    session.emplace(settings.mode, settings.difficulty, std::move(enabled), trackCount(), random);
+    std::optional<std::size_t> previousTrack;
+    if (!lastTrack.empty()) {
+        for (std::size_t i = 0; i < count; ++i) {
+            if (trackPath(i) == lastTrack) {
+                previousTrack = i;
+                break;
+            }
+        }
+    }
+    session.emplace(settings.mode, settings.difficulty, std::move(enabled), count, random, settings.practice,
+                    settings.shuffleTracks, previousTrack);
     clip.reset();
     active = true;
     status.clear();
     prepare();
 }
 
-void App::prepare() {
+void App::advanceTrial(Advance action, bool autoplay, std::optional<std::size_t> track) {
+    const auto previousTrack = session->trial.track;
+    session->advance(action, track);
+    if (session->trial.track != previousTrack) clip.reset();
+    prepare(autoplay);
+}
+
+void App::prepare(bool autoplay) {
     if (!active || preparation.joinable()) return;
     audio.reset();
     error = {};
@@ -902,20 +1103,44 @@ void App::prepare() {
         error = {AudioIssue::OutputUnavailable, {}};
         return;
     }
-    const auto index = session->trial.track;
-    const auto bundledCount = bundledTrackCount();
-    const auto track = index < bundledCount ? bundledTracks[index].path : settings.tracks[index - bundledCount];
-    const auto profile = profiles[session->trial.profile];
+    const auto& trial = session->trial;
+    const auto track = trackPath(trial.track);
+    const auto profile = profiles[trial.profile];
     const int rate = player.sampleRate();
     if (clip && rate != previousRate) {
         clip->start = static_cast<std::uint64_t>(clip->start) * rate / previousRate;
         clip->end = static_cast<std::uint64_t>(clip->end) * rate / previousRate;
     }
-    preparation = std::jthread([this, track, profile, rate](std::stop_token stop) {
-        auto result = prepareAudio(track, profile, rate, stop);
+    playWhenPrepared = autoplay;
+    const bool reuseMp3 = nextMp3 && nextMp3->track == trial.track && nextMp3->profile == trial.profile;
+    preparation = std::jthread([this, track, profile, rate, reuseMp3,
+                                prefetch = std::exchange(nextMp3, std::nullopt)](std::stop_token stop) mutable {
+        std::shared_ptr<const EncodedMp3> mp3;
+        if (reuseMp3) {
+            std::stop_callback cancel(stop, [&] { prefetch->worker.request_stop(); });
+            mp3 = prefetch->encoded.get();
+        }
+        prefetch.reset();
+        auto result = prepareAudio(track, profile, rate, stop, std::move(mp3));
         std::scoped_lock lock(resultMutex);
         prepared = std::move(result);
     });
+}
+
+void App::prefetchNextMp3() {
+    try {
+        const auto next = session->previewNext();
+        auto track = trackPath(next.track);
+        std::promise<std::shared_ptr<const EncodedMp3>> result;
+        auto encoded = result.get_future();
+        std::jthread worker([track = std::move(track), profile = profiles[next.profile],
+                             result = std::move(result)](std::stop_token stop) mutable {
+            result.set_value(preencodeMp3(track, profile, stop));
+        });
+        nextMp3.emplace(Mp3Preparation {next.track, next.profile, std::move(encoded), std::move(worker)});
+    } catch (const std::exception&) {
+        // The next trial can encode its MP3 on demand.
+    }
 }
 
 void App::poll() {
@@ -926,11 +1151,26 @@ void App::poll() {
     }
     if (result) {
         preparation.join();
-        if (active) {
+        const bool autoplay = std::exchange(playWhenPrepared, false);
+        if (active && requestedTrack) {
+            selectTrack(*requestedTrack);
+        } else if (active) {
             audio = std::move(result->audio);
             error = std::move(result->error);
             player.load(audio, session->trial.source(selected), clip);
+            if (audio) {
+                if (autoplay) player.toggle();
+                prefetchNextMp3();
+            }
         }
+        dirty = true;
+    }
+    if (!active && nextMp3 && nextMp3->encoded.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        nextMp3.reset();
+        dirty = true;
+    }
+    if (restartPending && !preparation.joinable() && !nextMp3) {
+        start();
         dirty = true;
     }
     if (active && audio) {
@@ -949,7 +1189,11 @@ void App::poll() {
 
 void App::finish() {
     if (!active) return;
+    lastTrack = trackPath(session->trial.track);
+    restartPending = settings.restartOnFinish;
+    requestedTrack.reset();
     if (preparation.joinable()) preparation.request_stop();
+    if (nextMp3) nextMp3->worker.request_stop();
     player.load(nullptr, 0);
     audio.reset();
     clip.reset();
@@ -960,6 +1204,18 @@ void App::finish() {
     capturing = -1;
     panel = Panel::Main;
     focused = 0;
+}
+
+void App::selectTrack(std::size_t index) {
+    if (index >= session->trackCount || index == session->trial.track) return;
+    panel = Panel::Main;
+    if (preparation.joinable()) {
+        requestedTrack = index;
+        preparation.request_stop();
+        return;
+    }
+    requestedTrack.reset();
+    advanceTrial(session->trial.response >= 0 ? Advance::Next : Advance::ChangeSong, false, index);
 }
 
 void App::choose(int side) {
@@ -975,8 +1231,8 @@ void App::movePlayhead(long long frame) {
 }
 
 std::size_t App::timelineFrame(int x) const {
-    const int offset = std::clamp(x, static_cast<int>(seekArea.left), static_cast<int>(seekArea.right)) - seekArea.left;
-    return static_cast<std::uint64_t>(audio->frames()) * offset / (seekArea.right - seekArea.left);
+    const int offset = std::clamp(x, timelineStart, timelineEnd) - timelineStart;
+    return static_cast<std::uint64_t>(audio->frames()) * offset / (timelineEnd - timelineStart);
 }
 
 std::optional<LoopRange> App::draggedLoop(int x) const {
@@ -997,10 +1253,10 @@ void App::setLoop(std::optional<LoopRange> range) {
 void App::click(int id) {
     status.clear();
     switch (id) {
-    case Library:
-        panel = panel == Panel::Library ? Panel::Main : Panel::Library;
+    case Change: case Library:
+        panel = id == Library && panel == Panel::Library ? Panel::Main : Panel::Library;
         capturing = -1;
-        page = 0;
+        page = active ? session->trial.track / pageSize : 0;
         break;
     case Preferences:
         panel = panel == Panel::Preferences ? Panel::Main : Panel::Preferences;
@@ -1008,17 +1264,25 @@ void App::click(int id) {
         break;
     case ClosePanel: panel = Panel::Main; capturing = -1; break;
     case Import: importTracks(); break;
+    case TogglePractice: if (!active) { settings.practice = !settings.practice; save(); } break;
+    case RestartOnFinishOption:
+        settings.restartOnFinish = !settings.restartOnFinish;
+        if (!settings.restartOnFinish) restartPending = false;
+        save();
+        break;
+    case ShuffleTracksOption:
+        settings.shuffleTracks = !settings.shuffleTracks;
+        if (active) session->shuffleTracks = settings.shuffleTracks;
+        save();
+        break;
     case Start: start(); break;
     case Finish: finish(); break;
     case Retry: prepare(); break;
-    case Next: case Skip: case Change: {
+    case Next: case NextAndPlay: case Skip: {
         if (!active || preparation.joinable()) break;
-        if ((id == Next) != (session->trial.response >= 0)) break;
-        if (id == Change && session->trackCount < 2) break;
-        const auto previousTrack = session->trial.track;
-        session->advance(id == Next ? Advance::Next : id == Skip ? Advance::Skip : Advance::ChangeSong);
-        if (session->trial.track != previousTrack) clip.reset();
-        prepare();
+        const bool next = id == Next || id == NextAndPlay;
+        if (next != (session->trial.response >= 0)) break;
+        advanceTrial(next ? Advance::Next : Advance::Skip, id == NextAndPlay);
         break;
     }
     case Seek: if (active && audio && panel == Panel::Main) player.seek(timelineFrame(pointer.x)); break;
@@ -1054,7 +1318,7 @@ void App::click(int id) {
         break;
     case ResetKeys: settings.keys = defaultKeys; capturing = -1; save(); break;
     default:
-        if (id >= PreferenceBase && id <= PreferenceBase + static_cast<int>(PreferencePage::Shortcuts)) {
+        if (id >= PreferenceBase && id < PreferenceBase + static_cast<int>(preferencePages.size())) {
             preferencePage = static_cast<PreferencePage>(id - PreferenceBase);
             capturing = -1;
         } else if (id >= ModeBase && id < ModeBase + 3 && !active) {
@@ -1077,6 +1341,9 @@ void App::click(int id) {
             settings.language = static_cast<LanguageSetting>(id - LanguageBase);
             updateLanguage();
             save();
+        } else if (id >= PickTrackBase && id < PickTrackBase + static_cast<int>(pageSize) &&
+                   active && panel == Panel::Library) {
+            selectTrack(page * pageSize + (id - PickTrackBase));
         } else if (id >= RemoveBase && id < RemoveBase + static_cast<int>(pageSize) && !active) {
             const auto index = page * pageSize + (id - RemoveBase);
             const auto bundledCount = bundledTrackCount();
@@ -1130,8 +1397,8 @@ void App::key(int code, bool repeat) {
     }
     if (code == VK_ESCAPE && panel != Panel::Main) { click(ClosePanel); return; }
     if (panel == Panel::Preferences && focused >= PreferenceBase &&
-        focused <= PreferenceBase + static_cast<int>(PreferencePage::Shortcuts) && (code == VK_LEFT || code == VK_RIGHT)) {
-        const int count = static_cast<int>(PreferencePage::Shortcuts) + 1;
+        focused < PreferenceBase + static_cast<int>(preferencePages.size()) && (code == VK_LEFT || code == VK_RIGHT)) {
+        const int count = static_cast<int>(preferencePages.size());
         const int step = code == VK_RIGHT ? 1 : count - 1;
         focused = PreferenceBase + (focused - PreferenceBase + step) % count;
         click(focused);
@@ -1144,7 +1411,9 @@ void App::key(int code, bool repeat) {
     if (!active || panel != Panel::Main || ((GetKeyState(VK_CONTROL) | GetKeyState(VK_SHIFT)) & 0x8000)) return;
     constexpr std::array controls {SelectA, SelectB, SelectX, Toggle, PlayPause, Rewind, FastForward, SubmitA, SubmitB};
     for (std::size_t i = 0; i < settings.keys.size(); ++i) {
-        if (settings.keys[i] == code && (!repeat || i == Back || i == Forward)) click(controls[i]);
+        if (settings.keys[i] == code && (!repeat || i == Back || i == Forward)) {
+            click(i == Play && session->trial.response >= 0 ? NextAndPlay : controls[i]);
+        }
     }
 }
 
