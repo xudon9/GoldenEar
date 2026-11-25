@@ -86,22 +86,22 @@ std::wstring diagnostic(HANDLE file) {
     return result;
 }
 
-std::wstring runFfmpeg(const std::wstring& arguments, std::vector<float>* samples, std::stop_token stop) {
-    if (stop.stop_requested()) return L"Audio preparation cancelled.";
+AudioError runFfmpeg(const std::wstring& arguments, std::vector<float>* samples, std::stop_token stop) {
+    if (stop.stop_requested()) return {AudioIssue::Cancelled, {}};
     SECURITY_ATTRIBUTES inherit {sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     HANDLE readRaw = nullptr;
     HANDLE writeRaw = nullptr;
-    if (!CreatePipe(&readRaw, &writeRaw, &inherit, 0)) return L"Could not create an FFmpeg output pipe.";
+    if (!CreatePipe(&readRaw, &writeRaw, &inherit, 0)) return {AudioIssue::PipeCreate, {}};
     Handle readEnd(readRaw);
     Handle writeEnd(writeRaw);
-    if (!SetHandleInformation(readEnd.get(), HANDLE_FLAG_INHERIT, 0)) return L"Could not configure the audio pipe.";
+    if (!SetHandleInformation(readEnd.get(), HANDLE_FLAG_INHERIT, 0)) return {AudioIssue::PipeConfigure, {}};
 
     TempFile log;
     Handle error(CreateFileW(log.path.c_str(), GENERIC_READ | GENERIC_WRITE,
                             FILE_SHARE_READ, &inherit, TRUNCATE_EXISTING, FILE_ATTRIBUTE_TEMPORARY, nullptr));
     Handle input(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                             &inherit, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (!error || !input) return L"Could not open the FFmpeg log or input handle.";
+    if (!error || !input) return {AudioIssue::FileHandles, {}};
 
     STARTUPINFOW startup {};
     startup.cb = sizeof(startup);
@@ -113,7 +113,7 @@ std::wstring runFfmpeg(const std::wstring& arguments, std::vector<float>* sample
     std::wstring command = quote(ffmpegPath()) + L" -nostdin -hide_banner -loglevel error " + arguments;
     if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
                         nullptr, nullptr, &startup, &info)) {
-        return L"Could not start FFmpeg. Put an FFmpeg build with libmp3lame on PATH, or set GOLDEN_EAR_FFMPEG to its full path, then retry.";
+        return {AudioIssue::FfmpegUnavailable, {}};
     }
     Handle process(info.hProcess);
     Handle mainThread(info.hThread);
@@ -129,7 +129,7 @@ std::wstring runFfmpeg(const std::wstring& arguments, std::vector<float>* sample
     if (ResumeThread(mainThread.get()) == static_cast<DWORD>(-1) && !stop.stop_requested()) {
         terminate(ERROR_INVALID_FUNCTION);
         WaitForSingleObject(process.get(), INFINITE);
-        return L"Windows could not start the FFmpeg process.";
+        return {AudioIssue::FfmpegLaunchFailed, {}};
     }
     writeEnd.reset();
 
@@ -151,19 +151,19 @@ std::wstring runFfmpeg(const std::wstring& arguments, std::vector<float>* sample
     const DWORD readError = GetLastError();
     readEnd.reset();
     WaitForSingleObject(process.get(), INFINITE);
-    if (stop.stop_requested()) return L"Audio preparation cancelled.";
+    if (stop.stop_requested()) return {AudioIssue::Cancelled, {}};
     DWORD exitCode = 1;
     GetExitCodeProcess(process.get(), &exitCode);
     if (exitCode != 0) {
-        return L"FFmpeg could not prepare this track. Check that the file plays and FFmpeg has libmp3lame. " + diagnostic(error.get());
+        return {AudioIssue::FfmpegFailed, diagnostic(error.get())};
     }
     if (readError != ERROR_BROKEN_PIPE || offset % (2 * sizeof(float)) != 0) {
-        return L"FFmpeg returned an incomplete audio stream.";
+        return {AudioIssue::Incomplete, {}};
     }
     return {};
 }
 
-std::wstring decode(const fs::path& path, int rate, std::vector<float>& samples, std::stop_token stop) {
+AudioError decode(const fs::path& path, int rate, std::vector<float>& samples, std::stop_token stop) {
     return runFfmpeg(L"-i " + quote(path.wstring()) + L" -map 0:a:0 -t 900.01 -ac 2 -ar " +
                      std::to_wstring(rate) + L" -c:a pcm_f32le -f f32le pipe:1", &samples, stop);
 }
@@ -200,30 +200,32 @@ void matchLevels(PreparedAudio& audio) {
 
 PreparedResult prepareAudio(const fs::path& track, const Profile& profile, int rate, std::stop_token stop) {
     try {
-        if (!fs::is_regular_file(track)) return {{}, L"This track has moved or is unavailable. Choose another song or re-import it."};
+        if (!fs::is_regular_file(track)) return {{}, {AudioIssue::TrackMissing, {}}};
         auto audio = std::make_shared<PreparedAudio>();
-        if (auto error = decode(track, rate, audio->samples[0], stop); !error.empty()) return {{}, std::move(error)};
-        if (audio->frames() > static_cast<std::size_t>(rate) * 900) return {{}, L"This track exceeds the 15-minute limit. Choose another song."};
+        if (auto error = decode(track, rate, audio->samples[0], stop); error) return {{}, std::move(error)};
+        if (audio->frames() > static_cast<std::size_t>(rate) * 900) return {{}, {AudioIssue::TrackTooLong, {}}};
         TempFile mp3;
         const std::wstring encode = L"-y -i " + quote(track.wstring()) + L" -map 0:a:0 -map_metadata -1 -ac 2 -ar " +
             std::to_wstring(profile.sampleRate) + L" -c:a libmp3lame -b:a " + std::to_wstring(profile.bitrate) +
             L"k -write_xing 1 -f mp3 " + quote(mp3.path.wstring());
-        if (auto error = runFfmpeg(encode, nullptr, stop); !error.empty()) return {{}, std::move(error)};
-        if (auto error = decode(mp3.path, rate, audio->samples[1], stop); !error.empty()) return {{}, std::move(error)};
+        if (auto error = runFfmpeg(encode, nullptr, stop); error) return {{}, std::move(error)};
+        if (auto error = decode(mp3.path, rate, audio->samples[1], stop); error) return {{}, std::move(error)};
         const auto commonSize = std::min(audio->samples[0].size(), audio->samples[1].size());
-        if (!commonSize) return {{}, L"This file contains no playable audio."};
+        if (!commonSize) return {{}, {AudioIssue::Empty, {}}};
         for (auto& samples : audio->samples) samples.resize(commonSize);
         matchLevels(*audio);
         return {std::move(audio), {}};
     } catch (const std::bad_alloc&) {
-        return {{}, L"There is too little memory to prepare both versions. Try a shorter track."};
+        return {{}, {AudioIssue::Memory, {}}};
     } catch (const std::exception&) {
-        return {{}, L"Could not read the track or write temporary audio. Check the file and the Windows temporary directory."};
+        return {{}, {AudioIssue::Io, {}}};
     }
 }
 
-void renderAudio(const PreparedAudio& audio, std::size_t frame, float* output, std::size_t count,
-                 int source, float& blend, int sampleRate) {
+namespace {
+
+void renderFrames(const PreparedAudio& audio, std::size_t frame, float* output, std::size_t count,
+                  int source, float& blend, int sampleRate) {
     const auto offset = 2 * frame;
     const auto* first = audio.samples[0].data() + offset;
     const auto* second = audio.samples[1].data() + offset;
@@ -238,6 +240,40 @@ void renderAudio(const PreparedAudio& audio, std::size_t frame, float* output, s
     }
     const auto* active = source == 0 ? first : second;
     std::copy(active + i, active + 2 * count, output + i);
+}
+
+std::optional<LoopRange> clampLoop(std::optional<LoopRange> range, std::size_t frames) {
+    if (!range) return {};
+    range->end = std::min(range->end, frames);
+    return range->start < range->end ? range : std::nullopt;
+}
+
+}
+
+void renderAudio(const PreparedAudio& audio, std::size_t frame, float* output, std::size_t count,
+                 int source, float& blend, int sampleRate, const LoopRange* loop) {
+    if (!loop) {
+        renderFrames(audio, frame, output, count, source, blend, sampleRate);
+        return;
+    }
+
+    // Use the same edge fades for both versions to suppress clicks at the loop seam.
+    const auto fade = std::min((loop->end - loop->start - 1) / 2, static_cast<std::size_t>(sampleRate / 500));
+    while (count) {
+        const auto chunk = std::min(count, loop->end - frame);
+        renderFrames(audio, frame, output, chunk, source, blend, sampleRate);
+        for (std::size_t i = 0; i < chunk; ++i) {
+            const auto distance = std::min(frame + i - loop->start, loop->end - 1 - frame - i);
+            if (distance < fade) {
+                const auto gain = static_cast<float>(distance) / fade;
+                output[2 * i] *= gain;
+                output[2 * i + 1] *= gain;
+            }
+        }
+        output += 2 * chunk;
+        count -= chunk;
+        frame = loop->start;
+    }
 }
 
 bool Player::open() {
@@ -303,24 +339,34 @@ void Player::close() {
     if (wake) CloseHandle(wake);
     wake = nullptr;
     audio.reset();
+    loop.reset();
     playing = false;
 }
 
-void Player::load(std::shared_ptr<const PreparedAudio> next, int source) {
+void Player::load(std::shared_ptr<const PreparedAudio> next, int source, std::optional<LoopRange> range) {
     std::scoped_lock lock(mutex);
     audio = std::move(next);
     playing = false;
     target = source;
-    reset(0);
+    loop = clampLoop(range, audio ? audio->frames() : 0);
+    reset(loop ? loop->start : 0);
 }
 
 void Player::reset(std::size_t frame) {
     if (device) waveOutReset(device);
     for (auto& buffer : buffers) buffer.queued = false;
-    cursor = origin = frame;
+    origin = frame;
+    submitted = 0;
     drained = false;
     blend = static_cast<float>(target);
-    if (device && playing) SetEvent(wake);
+    if (device && playing) {
+        if (waveOutRestart(device) == MMSYSERR_NOERROR) {
+            SetEvent(wake);
+        } else {
+            playing = false;
+            failed = true;
+        }
+    }
 }
 
 void Player::select(int source) {
@@ -331,7 +377,7 @@ void Player::select(int source) {
 void Player::toggle() {
     std::scoped_lock lock(mutex);
     if (!device || !audio || failed) return;
-    if (!playing && (drained || position() == audio->frames())) reset(0);
+    if (!playing && (drained || position() == audio->frames())) reset(loop ? loop->start : 0);
     playing = !playing;
     const auto result = playing ? waveOutRestart(device) : waveOutPause(device);
     if (result != MMSYSERR_NOERROR) {
@@ -344,25 +390,49 @@ void Player::toggle() {
 void Player::seek(std::size_t frame) {
     std::scoped_lock lock(mutex);
     if (!device || !audio) return;
-    reset(std::min(frame, audio->frames()));
-    if (playing) waveOutRestart(device);
+    reset(loop ? std::clamp(frame, loop->start, loop->end - 1) : std::min(frame, audio->frames()));
+}
+
+void Player::setLoop(std::optional<LoopRange> range) {
+    std::scoped_lock lock(mutex);
+    if (!device || !audio || failed || (!loop && !range)) return;
+    const auto frame = position();
+    loop = clampLoop(range, audio->frames());
+    reset(loop ? loop->start : frame);
+}
+
+std::size_t Player::frameAt(std::uint64_t elapsed) const {
+    return loop ? loop->frameAt(origin, elapsed) : static_cast<std::size_t>(origin + elapsed);
 }
 
 std::size_t Player::position() {
     if (!device || !audio) return 0;
-    if (drained) return cursor;
+    if (drained) return frameAt(submitted);
     MMTIME time {};
     time.wType = TIME_SAMPLES;
     if (waveOutGetPosition(device, &time, sizeof(time)) != MMSYSERR_NOERROR) return origin;
-    if (time.wType == TIME_SAMPLES) return std::min(cursor, origin + time.u.sample);
-    if (time.wType == TIME_BYTES) return std::min(cursor, origin + time.u.cb / (2 * sizeof(float)));
-    if (time.wType == TIME_MS) return std::min(cursor, origin + static_cast<std::size_t>(time.u.ms) * rate / 1000);
-    return origin;
+    std::uint64_t period = std::uint64_t{1} << 32;
+    std::uint64_t elapsed = 0;
+    switch (time.wType) {
+    case TIME_SAMPLES: elapsed = time.u.sample; break;
+    case TIME_BYTES:
+        elapsed = time.u.cb / (2 * sizeof(float));
+        period /= 2 * sizeof(float);
+        break;
+    case TIME_MS:
+        elapsed = static_cast<std::uint64_t>(time.u.ms) * rate / 1000;
+        period = period * rate / 1000;
+        break;
+    default: return origin;
+    }
+    // The device's 32-bit counter can wrap during a long-running loop.
+    if (submitted >= elapsed) elapsed += (submitted - elapsed) / period * period;
+    return frameAt(std::min(submitted, elapsed));
 }
 
 Player::State Player::state() {
     std::scoped_lock lock(mutex);
-    return {position(), playing, failed || !device};
+    return {position(), playing, failed || !device, loop};
 }
 
 void Player::run() {
@@ -378,9 +448,11 @@ void Player::fill() {
     bool queued = false;
     for (auto& buffer : buffers) {
         if (buffer.queued && (buffer.header.dwFlags & WHDR_DONE)) buffer.queued = false;
-        if (!buffer.queued && cursor < audio->frames()) {
-            const auto count = std::min(buffer.data.size() / 2, audio->frames() - cursor);
-            renderAudio(*audio, cursor, buffer.data.data(), count, target, blend, rate);
+        const auto frame = frameAt(submitted);
+        if (!buffer.queued && frame < audio->frames()) {
+            const auto capacity = buffer.data.size() / 2;
+            const auto count = loop ? capacity : std::min(capacity, audio->frames() - frame);
+            renderAudio(*audio, frame, buffer.data.data(), count, target, blend, rate, loop ? &*loop : nullptr);
             buffer.header.dwBufferLength = static_cast<DWORD>(2 * count * sizeof(float));
             if (waveOutWrite(device, &buffer.header, sizeof(WAVEHDR)) != MMSYSERR_NOERROR) {
                 playing = false;
@@ -389,7 +461,7 @@ void Player::fill() {
                 return;
             }
             buffer.queued = true;
-            cursor += count;
+            submitted += count;
         }
         queued |= buffer.queued;
     }

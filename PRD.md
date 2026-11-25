@@ -2,11 +2,11 @@
 
 ## Goal
 
-Golden Ear is a local Windows listening lab. A listener supplies their own lossless tracks and can find out which MP3 settings they can distinguish from the source under their current listening conditions.
+Golden Ear is a local Windows listening lab. Listeners use bundled or imported lossless tracks to find out which MP3 settings they can distinguish from the source under their current listening conditions.
 
 ## Session flow
 
-1. Import FLAC or WAV tracks into the repertoire. Keep references to the original files across launches. The user can remove references without changing the source files.
+1. Make bundled public-domain and CC0 recordings available by default and let listeners hide them in the repertoire. Allow listeners to import FLAC or WAV tracks and remove references without changing the source files. Save imported references and bundled-track visibility across launches.
 2. Choose a test type, a difficulty mode and one or more MP3 profiles, then start a session. Keep this configuration fixed until the session ends.
 3. Choose a track at random for each trial. With multiple tracks, avoid immediate repeats. Randomize which side is lossless and, in ABX, independently randomize whether X is A or B.
 4. Play, pause, seek, switch between versions or listen again before answering. Select listening sources and submit answers using distinct mouse controls or shortcuts. The listener can skip a trial or request a different song at the same quality. Both actions discard the unanswered trial.
@@ -38,16 +38,19 @@ Golden Ear is a local Windows listening lab. A listener supplies their own lossl
 - Decode the first audio stream to a common stereo floating-point playback format. Encode MP3 using LAME at the selected sample rate and bitrate, then decode it into the same format. Use a seekable MP3 with a Xing/Info header so the decoder can compensate for encoder delay and end padding. Use the shared valid frame range, match whole-track RMS, and apply shared peak headroom.
 - Keep a single playback clock and queue. Switch sources at the same frame using a short crossfade without restarting playback or changing the play/pause state. A, B and X share the same gain, playback position and transport controls. Shared Windows audio output may resample for the selected hardware. Results reflect this complete playback chain.
 - Default controls are J/K/L to listen to A/B/X, semicolon to toggle A/B, Space for play/pause, comma/period to seek five seconds, and 1/2 to answer A/B. Save personalized keys and reject duplicates. Give mouse access to the same actions and provide a clickable seek bar.
+- Let listeners drag across the waveform or mark two playhead positions to loop a clip. Highlight the range and repeat it on the shared playback clock for every sample. Keep the loop for consecutive trials using the same track and provide a clear-loop control.
 - Prepare audio off the UI thread. Report missing files, unsupported inputs, unavailable FFmpeg and device failures with recovery guidance. Support tracks up to 15 minutes and keep one prepared pair in memory.
 
 ## Statistics
 
 - Show scored answers, correct count and accuracy by MP3 profile. For ABX and Identify Hi-Fi, use a one-sided anytime-valid p-value for performance above 50% guessing. Compute the running maximum of a mixture of Bernoulli likelihood ratios for success rates 0.60, 0.70, 0.80, 0.90 and 0.99. Take its reciprocal, multiply by the number of enabled profiles for family-wise error control, and cap at 1. Show “Above chance” at adjusted p ≤ 0.05 and “Inconclusive” otherwise. This supports checking results continuously and stopping whenever the listener chooses. [Ramdas et al., Game-Theoretic Statistics and Safe Anytime-Valid Inference](https://arxiv.org/abs/2210.01948)
 - Preference includes the share of answers favoring the lossless version. Preference and objective identification describe different outcomes. An inconclusive score leaves discrimination ability unresolved.
-- Scores describe the current session, using the imported music and current listening setup. For inference, the null is that correctness is at most 50% on each scored trial given its profile and past results. Record skipped and replaced trials separately from submitted answers.
+- Scores describe the current session, using its music and current listening setup. For inference, the null is that correctness is at most 50% on each scored trial given its profile and past results. Record skipped and replaced trials separately from submitted answers.
 
 ## Interface and delivery
 
 - Build a native C++20 Windows desktop application at the repository root, with an offline audio path and FFmpeg with `libmp3lame` as a runtime dependency. Keep personal audio local. Native file selection supports multiple files.
-- Use a dark listening console with a dominant A/B/X selector, clear playback and response states, and persistent session results. Keep codec assignments hidden in the listening view until an answer is submitted. Make all trial actions available with the mouse.
+- Use a listening console with a dominant A/B/X selector, clear playback and response states, and persistent session results. Keep codec assignments hidden in the listening view until an answer is submitted. Make all trial actions available with the mouse.
+- Group appearance, language, and shortcuts under Preferences. Follow the Windows app theme by default, provide light and dark overrides, and honor Windows contrast themes.
+- Provide English, Simplified Chinese, and Spanish for the app interface. Default to the first supported Windows display language, with English as the fallback. Save manual language choices and apply them immediately.
 - Verify both difficulty schedules, scoring and early stopping, real audio conversion and alignment, and a native build. Check the transition across A/B/X for position continuity and report any hardware playback limitations encountered during verification.

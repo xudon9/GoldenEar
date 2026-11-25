@@ -1,4 +1,5 @@
 #include "audio.hpp"
+#include "i18n.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -12,6 +13,39 @@ namespace fs = std::filesystem;
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void testLanguages() {
+    using namespace std::literals;
+    require(selectLanguage(std::array{L"de-DE"sv, L"ES-MX"sv, L"en-US"sv}) == Language::Spanish,
+            "Detection did not use the first supported display language");
+    require(selectLanguage(std::array{L"zh-Hans-CN"sv, L"en"sv}) == Language::SimplifiedChinese &&
+            selectLanguage(std::array{L"zh-SG"sv}) == Language::SimplifiedChinese,
+            "Automatic language did not recognize Simplified Chinese");
+    require(selectLanguage(std::array{L"zh-TW"sv, L"zh-Hant"sv, L"es-ES"sv}) == Language::Spanish,
+            "Traditional Chinese must use the next supported preference");
+    require(selectLanguage(std::array{L"en-GB"sv, L"es"sv}) == Language::English &&
+            selectLanguage(std::array{L"fr-CA"sv}) == Language::English && selectLanguage({}) == Language::English,
+            "English priority or fallback is incorrect");
+
+    constexpr std::array options {LanguageSetting::Auto, LanguageSetting::English, LanguageSetting::SimplifiedChinese, LanguageSetting::Spanish};
+    for (const auto option : options) require(parseLanguageCode(languageCode(option)) == option, "Language code did not round-trip");
+    require(parseLanguageCode("unknown") == LanguageSetting::Auto &&
+            resolveLanguage(LanguageSetting::SimplifiedChinese) == Language::SimplifiedChinese &&
+            resolveLanguage(LanguageSetting::Spanish) == Language::Spanish, "Manual override or unknown preference is incorrect");
+
+    for (const auto language : {Language::English, Language::SimplifiedChinese, Language::Spanish}) {
+        const Localizer locale(language);
+        for (int i = 0; i < static_cast<int>(Text::Count); ++i) {
+            const auto rendered = locale.format(static_cast<Text>(i), 1, 2, 3);
+            require(!rendered.empty() && rendered.find_first_of(L"{}") == std::wstring::npos, "Translation is missing or has an invalid template");
+        }
+    }
+    const Localizer spanish(Language::Spanish);
+    require(spanish.sampleRate(22050) == L"22,05 kHz" && spanish.pValue(0.04) == L"p = 0,040", "Spanish decimal display is incorrect");
+    require(Localizer().sampleRate(44100) == L"44.1 kHz", "English decimal display is incorrect");
+    require(Localizer(Language::SimplifiedChinese).format(Text::AbxAnswer, L'A', L'B') == L"X 与 A 相同。B 是无损版本。",
+            "Answer formatting lost the selected samples");
 }
 
 void testSessions() {
@@ -97,6 +131,40 @@ void testRender() {
     }
 }
 
+void testLoopRender() {
+    PreparedAudio audio;
+    for (std::size_t frame = 0; frame < 100; ++frame) {
+        const auto value = static_cast<float>(frame) / 100;
+        audio.samples[0].insert(audio.samples[0].end(), {value, -value});
+        audio.samples[1].insert(audio.samples[1].end(), {value / 2, -value / 2});
+    }
+    const LoopRange loop {50, 62};
+    require(loop.frameAt(59, 2) == 61 && loop.frameAt(59, 3) == 50 && loop.frameAt(59, 28) == 51,
+            "The playhead must wrap at the exclusive loop end");
+
+    std::array<float, 56> output {};
+    for (const int side : {0, 1}) {
+        auto blend = static_cast<float>(side);
+        renderAudio(audio, 59, output.data(), output.size() / 2, side, blend, 1000, &loop);
+        for (std::size_t i = 0; i < output.size() / 2; ++i) {
+            const auto offset = (9 + i) % 12;
+            const auto frame = 50 + offset;
+            const auto gain = std::min({offset, 11 - offset, std::size_t{2}}) / 2.0f;
+            require(output[2 * i] == audio.samples[side][2 * frame] * gain && output[2 * i + 1] == -output[2 * i],
+                    "The render must wrap within the buffer and apply identical edge fades to both sources");
+        }
+    }
+
+    float blend = 0;
+    renderAudio(audio, 60, output.data(), 4, 1, blend, 4000, &loop);
+    require(blend == 0.5f && std::abs(output[6] - std::lerp(0.51f, 0.255f, 0.5f) / 5) < 1e-6f,
+            "Switching source across the loop seam must preserve the crossfade and frame alignment");
+
+    const LoopRange singleFrame {50, 51};
+    renderAudio(audio, 50, output.data(), output.size() / 2, 0, blend, 1000, &singleFrame);
+    require(output.front() == 0.5f && output.back() == -0.5f, "A one-frame selection must still wrap and render");
+}
+
 void writeNumber(std::ostream& file, std::uint32_t number, int bytes) {
     for (int i = 0; i < bytes; ++i) file.put(static_cast<char>((number >> (8 * i)) & 255));
 }
@@ -140,7 +208,9 @@ void testCodecs() {
     makeWav(path, rate);
     for (const auto& profile : profiles) {
         const auto prepared = prepareAudio(path, profile, rate);
-        if (!prepared.audio) std::wcerr << prepared.error << L'\n';
+        if (!prepared.audio) {
+            std::wcerr << L"Audio issue " << static_cast<int>(prepared.error.issue) << L" " << prepared.error.detail << L'\n';
+        }
         require(prepared.audio != nullptr, "Could not prepare one of the MP3 profiles");
         const auto& pair = *prepared.audio;
         require(pair.frames() >= 2 * rate - 12 && pair.samples[0].size() == pair.samples[1].size(),
@@ -172,14 +242,16 @@ void testCodecs() {
             if (correlation > best) { best = correlation; bestLag = lag; }
         }
         require(best > 0.95 && std::abs(bestLag) <= 2, "Compensated MP3 is not aligned with the reference");
-        std::wcout << profile.label << L" | lag " << bestLag << L" frames | correlation " << best << L'\n';
+        std::wcout << Localizer().sampleRate(profile.sampleRate) << L" / " << profile.bitrate << L" kbps | lag "
+                   << bestLag << L" frames | correlation " << best << L'\n';
     }
     std::stop_source stop;
     stop.request_stop();
-    require(!prepareAudio(path, profiles[0], rate, stop.get_token()).audio, "Cancelled preparation returned audio");
+    require(prepareAudio(path, profiles[0], rate, stop.get_token()).error.issue == AudioIssue::Cancelled,
+            "Cancelled preparation returned the wrong error");
     fs::path missing = path;
     missing += L".missing";
-    require(!prepareAudio(missing, profiles[0], rate).audio, "Missing track was accepted");
+    require(prepareAudio(missing, profiles[0], rate).error.issue == AudioIssue::TrackMissing, "Missing track returned the wrong error");
 }
 
 void testOutputDevice() {
@@ -214,6 +286,35 @@ void testOutputDevice() {
     player.toggle();
     std::this_thread::sleep_for(150ms);
     require(player.state().position > static_cast<std::size_t>(rate), "Playback did not resume after seeking");
+
+    const LoopRange loop {static_cast<std::size_t>(rate / 4), static_cast<std::size_t>(rate / 2)};
+    player.setLoop(loop);
+    auto last = player.state().position;
+    bool wrapped = false;
+    int source = 0;
+    const auto loopDeadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < loopDeadline && !wrapped) {
+        std::this_thread::sleep_for(10ms);
+        const auto state = player.state();
+        require(state.playing && !state.failed && state.position >= loop.start && state.position < loop.end,
+                "Loop playback must stay active and inside the selected range");
+        wrapped = state.position < last;
+        last = state.position;
+        player.select(source);
+        source = 1 - source;
+    }
+    require(wrapped, "The output device playhead did not wrap");
+
+    player.toggle();
+    player.seek(0);
+    require(player.state().position == loop.start, "Seeking before the selected range must stop at its start");
+    player.seek(rate);
+    require(player.state().position == loop.end - 1, "Seeking beyond the selected range must stop at its end");
+    player.setLoop({});
+    require(!player.state().loop && player.state().position == loop.end - 1, "Clearing a paused loop changed the playhead");
+    player.toggle();
+    std::this_thread::sleep_for(150ms);
+    require(player.state().position >= loop.end && player.state().playing, "Clearing a loop must restore full-track playback");
     std::cout << "Windows output clock verified at " << rate << " Hz\n";
 }
 
@@ -224,9 +325,11 @@ int main(int argc, char** argv) {
         } else if (argc > 1 && std::string_view(argv[1]) == "--playback") {
             testOutputDevice();
         } else {
+            testLanguages();
             testSessions();
             testEvidence();
             testRender();
+            testLoopRender();
         }
         std::cout << "Passed\n";
         return 0;

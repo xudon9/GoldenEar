@@ -10,15 +10,14 @@
 struct Profile {
     int sampleRate;
     int bitrate;
-    const wchar_t* label;
 };
 
 inline constexpr std::array<Profile, 5> profiles {{
-    {16000, 32, L"16 kHz / 32 kbps"},
-    {22050, 56, L"22.05 kHz / 56 kbps"},
-    {32000, 96, L"32 kHz / 96 kbps"},
-    {44100, 160, L"44.1 kHz / 160 kbps"},
-    {48000, 320, L"48 kHz / 320 kbps"}
+    {16000, 32},
+    {22050, 56},
+    {32000, 96},
+    {44100, 160},
+    {48000, 320}
 }};
 
 enum class Mode { Abx, Identify, Preference };
