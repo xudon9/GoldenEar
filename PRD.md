@@ -48,6 +48,6 @@ Golden Ear is a local Windows listening lab. A listener supplies their own lossl
 
 ## Interface and delivery
 
-- Build a native C++20 Windows desktop application in `golden-ear-app`, with an offline audio path and FFmpeg with `libmp3lame` as a runtime dependency. Keep personal audio local. Native file selection supports multiple files.
+- Build a native C++20 Windows desktop application at the repository root, with an offline audio path and FFmpeg with `libmp3lame` as a runtime dependency. Keep personal audio local. Native file selection supports multiple files.
 - Use a dark listening console with a dominant A/B/X selector, clear playback and response states, and persistent session results. Keep codec assignments hidden in the listening view until an answer is submitted. Make all trial actions available with the mouse.
 - Verify both difficulty schedules, scoring and early stopping, real audio conversion and alignment, and a native build. Check the transition across A/B/X for position continuity and report any hardware playback limitations encountered during verification.

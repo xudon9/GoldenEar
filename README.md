@@ -1,12 +1,12 @@
 # Golden Ear
 
-Golden Ear is a native Windows application for blind listening tests. Import FLAC or WAV tracks, choose ABX, Identify Hi-Fi or Preference, and compare each lossless track with an MP3 encoded on demand. [Product requirements](../PRD.md)
+Golden Ear is a native Windows application for blind listening tests. Import FLAC or WAV tracks, choose ABX, Identify Hi-Fi or Preference, and compare each lossless track with an MP3 encoded on demand. [Product requirements](PRD.md)
 
 ## Build and run
 
 Use a Windows C++20 compiler and CMake. FFmpeg must include `libmp3lame`. Put `ffmpeg.exe` on `PATH` or set `GOLDEN_EAR_FFMPEG` to its full executable path. [FFmpeg encoder documentation](https://ffmpeg.org/ffmpeg-codecs.html#libmp3lame)
 
-From this directory, configure and build with Visual Studio and the Desktop development with C++ workload.
+From the repository root, configure and build with Visual Studio and the Desktop development with C++ workload.
 
 ```powershell
 cmake -S . -B build
