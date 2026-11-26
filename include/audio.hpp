@@ -21,12 +21,13 @@ struct PreparedAudio {
     static constexpr std::size_t overviewSize = 128;
     std::array<std::vector<float>, 2> samples;
     std::array<float, overviewSize> overview {};
+    std::optional<std::filesystem::file_time_type> sourceWriteTime;
     std::size_t frames() const { return samples[0].size() / 2; }
 };
 
 enum class AudioIssue {
     None, Cancelled, PipeCreate, PipeConfigure, FileHandles, FfmpegUnavailable, FfmpegLaunchFailed,
-    FfmpegFailed, Incomplete, TrackMissing, TrackTooLong, Empty, Memory, Io, OutputUnavailable, OutputStopped
+    FfmpegFailed, LdacFailed, Incomplete, TrackMissing, TrackTooLong, Empty, Memory, Io, OutputUnavailable, OutputStopped
 };
 
 struct AudioError {
@@ -40,12 +41,10 @@ struct PreparedResult {
     AudioError error;
 };
 
-struct EncodedMp3;
-std::shared_ptr<const EncodedMp3> preencodeMp3(const std::filesystem::path& track, const Profile& profile,
-                                              std::stop_token stop = {});
-PreparedResult prepareAudio(const std::filesystem::path& track, const Profile& profile,
-                            int outputRate, std::stop_token stop = {},
-                            std::shared_ptr<const EncodedMp3> prefetched = {});
+class EncodedAudioCache;
+void prefetchAudio(EncodedAudioCache& cache, const std::filesystem::path& track, const Profile& profile, std::stop_token stop = {});
+PreparedResult prepareAudio(EncodedAudioCache& cache, const std::filesystem::path& track, const Profile& profile,
+                            int outputRate, std::stop_token stop = {});
 
 struct LoopRange {
     std::size_t start;

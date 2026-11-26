@@ -1,11 +1,19 @@
 #include "audio.hpp"
+#include "encoded_audio_cache.hpp"
+
+#include <ldacBT.h>
+#include <ldacdec.h>
 
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 
 namespace fs = std::filesystem;
+
+namespace {
 
 struct TempFile {
     fs::path path;
@@ -21,21 +29,6 @@ struct TempFile {
     TempFile(const TempFile&) = delete;
     TempFile& operator=(const TempFile&) = delete;
 };
-
-struct EncodedMp3 {
-    fs::path track;
-    Profile profile;
-    fs::file_time_type modified;
-    TempFile file;
-
-    bool matches(const fs::path& source, const Profile& quality) const {
-        std::error_code error;
-        return track == source && profile.sampleRate == quality.sampleRate && profile.bitrate == quality.bitrate &&
-            fs::last_write_time(source, error) == modified && !error;
-    }
-};
-
-namespace {
 
 class Handle {
 public:
@@ -178,16 +171,148 @@ AudioError runFfmpeg(const std::wstring& arguments, std::vector<float>* samples,
     return {};
 }
 
-AudioError decode(const fs::path& path, int rate, std::vector<float>& samples, std::stop_token stop) {
-    return runFfmpeg(L"-i " + quote(path.wstring()) + L" -map 0:a:0 -t 900.01 -ac 2 -ar " +
-                     std::to_wstring(rate) + L" -c:a pcm_f32le -f f32le pipe:1", &samples, stop);
+AudioError decode(const fs::path& path, int rate, std::vector<float>& samples, std::stop_token stop,
+                  const std::wstring& inputOptions = {}, const std::wstring& filter = {}) {
+    return runFfmpeg(inputOptions + L" -i " + quote(path.wstring()) + L" -map 0:a:0 -t 900.01 " + filter +
+                     L" -ac 2 -ar " + std::to_wstring(rate) + L" -c:a pcm_f32le -f f32le pipe:1", &samples, stop);
 }
 
-AudioError encodeMp3(const fs::path& track, const Profile& profile, const fs::path& output, std::stop_token stop) {
-    const std::wstring arguments = L"-y -i " + quote(track.wstring()) + L" -map 0:a:0 -map_metadata -1 -t 900.01 -ac 2 -ar " +
-        std::to_wstring(profile.sampleRate) + L" -c:a libmp3lame -b:a " + std::to_wstring(profile.bitrate) +
-        L"k -write_xing 1 -f mp3 " + quote(output.wstring());
-    return runFfmpeg(arguments, nullptr, stop);
+// These raw streams carry no delay or end-padding metadata. Trim at the codec's sample rate.
+constexpr int aptxHdDelay = 90;
+constexpr int sbcDelay = 73;
+constexpr int ldacFrameSamples = LDACBT_ENC_LSU; // At 48 kHz.
+
+std::wstring pcmFormat(int rate) {
+    return L" -f f32le -ar " + std::to_wstring(rate) + L" -ac 2 ";
+}
+
+AudioError encodeLdac(const fs::path& track, const Profile& profile, const fs::path& output, std::stop_token stop) {
+    TempFile pcm;
+    if (auto error = runFfmpeg(L"-y -i " + quote(track.wstring()) + L" -map 0:a:0 -t 900.01" +
+        pcmFormat(profile.sampleRate) + L"-c:a pcm_f32le " + quote(pcm.path.wstring()), nullptr, stop); error) return error;
+
+    // The Sony encoder writes shared transform table pointers on every initialization.
+    static std::mutex encoderMutex;
+    const std::scoped_lock lock(encoderMutex);
+    if (stop.stop_requested()) return {AudioIssue::Cancelled, {}};
+    const auto quality = profile.bitrate == 990 ? LDACBT_EQMID_HQ :
+                         profile.bitrate == 660 ? LDACBT_EQMID_SQ : LDACBT_EQMID_MQ;
+    const std::unique_ptr<std::remove_pointer_t<HANDLE_LDAC_BT>, decltype(&ldacBT_free_handle)>
+        encoder(ldacBT_get_handle(), ldacBT_free_handle);
+    constexpr int bluetoothMtu = 679;
+    if (!encoder || ldacBT_init_handle_encode(encoder.get(), bluetoothMtu, quality, LDACBT_CHANNEL_MODE_STEREO,
+        LDACBT_SMPL_FMT_F32, profile.sampleRate) != 0 || ldacBT_get_bitrate(encoder.get()) != profile.bitrate) {
+        return {AudioIssue::LdacFailed, {}};
+    }
+
+    std::ifstream input(pcm.path, std::ios::binary);
+    std::ofstream encoded(output, std::ios::binary | std::ios::trunc);
+    if (!input || !encoded) return {AudioIssue::Io, {}};
+    std::array<float, 2 * ldacFrameSamples> samples {};
+    std::array<unsigned char, LDACBT_MAX_NBYTES> stream {};
+    constexpr auto blockSize = static_cast<std::streamsize>(sizeof samples);
+    for (;;) {
+        if (stop.stop_requested()) return {AudioIssue::Cancelled, {}};
+        input.read(reinterpret_cast<char*>(samples.data()), blockSize);
+        const auto read = input.gcount();
+        if (input.bad() || read % (2 * sizeof(float)) != 0) return {AudioIssue::Io, {}};
+        std::fill(samples.begin() + read / sizeof(float), samples.end(), 0.0f);
+        int consumed = 0;
+        int bytes = 0;
+        int frames = 0;
+        if (ldacBT_encode(encoder.get(), read ? samples.data() : nullptr, &consumed, stream.data(), &bytes, &frames) != 0 ||
+            (read && consumed != blockSize)) return {AudioIssue::LdacFailed, {}};
+        if (!encoded.write(reinterpret_cast<const char*>(stream.data()), bytes)) return {AudioIssue::Io, {}};
+        if (!read && !bytes) break;
+    }
+    encoded.close();
+    return encoded ? AudioError {} : AudioError {AudioIssue::Io, {}};
+}
+
+AudioError decodeLdac(const fs::path& path, int codecRate, int rate, std::vector<float>& samples, std::stop_token stop) {
+    static std::once_flag tables;
+    std::call_once(tables, ldacdecInitTables);
+    ldacdec_t decoder {};
+    ldacdecInit(&decoder);
+    TempFile pcm;
+    std::ifstream encoded(path, std::ios::binary);
+    std::ofstream decoded(pcm.path, std::ios::binary | std::ios::trunc);
+    if (!encoded || !decoded) return {AudioIssue::Io, {}};
+    // Only process frames generated by our encoder, using the length from the transport header.
+    constexpr int headerSize = 3;
+    constexpr int maxFrameSize = headerSize + 512;
+    std::array<std::uint8_t, maxFrameSize + 4> frame {};
+    std::array<float, 2 * ldacFrameSamples> block {};
+    bool first = true;
+    for (;;) {
+        if (stop.stop_requested()) return {AudioIssue::Cancelled, {}};
+        if (!encoded.read(reinterpret_cast<char*>(frame.data()), headerSize)) break;
+        const int payloadSize = (((frame[1] & 7) << 6) | (frame[2] >> 2)) + 1;
+        if (frame[0] != 0xaa || (frame[1] >> 5) != 1 || ((frame[1] >> 3) & 3) != 2 ||
+            !encoded.read(reinterpret_cast<char*>(frame.data() + headerSize), payloadSize)) return {AudioIssue::Incomplete, {}};
+        int used = 0;
+        if (ldacDecode(&decoder, frame.data(), block.data(), &used) != 0 || used != payloadSize + headerSize) {
+            return {AudioIssue::LdacFailed, {}};
+        }
+        // The overlap-add filter delays the decoded signal by one frame.
+        if (!first && !decoded.write(reinterpret_cast<const char*>(block.data()), sizeof block)) return {AudioIssue::Io, {}};
+        first = false;
+    }
+    if (encoded.bad() || encoded.gcount() != 0) return {AudioIssue::Incomplete, {}};
+    decoded.close();
+    if (!decoded) return {AudioIssue::Io, {}};
+    return decode(pcm.path, rate, samples, stop, pcmFormat(codecRate));
+}
+
+AudioError encodeAudio(const fs::path& track, const Profile& profile, const fs::path& output, std::stop_token stop) {
+    if (profile.codec == Codec::Ldac) return encodeLdac(track, profile, output, stop);
+    const auto sampleRate = std::to_wstring(profile.sampleRate);
+    const auto bitrate = L" -b:a " + std::to_wstring(profile.bitrate) + L"k";
+    std::wstring options;
+    switch (profile.codec) {
+    case Codec::Mp3: options = L" -c:a libmp3lame" + bitrate + L" -write_xing 1 -f mp3"; break;
+    case Codec::Aac: options = L" -c:a aac -profile:a aac_low" + bitrate + L" -movie_timescale " + sampleRate + L" -f mp4"; break;
+    case Codec::AptxHd:
+        options = L" -af aresample=" + sampleRate + L",apad=pad_len=128 -c:a aptx_hd -f aptx_hd";
+        break;
+    case Codec::Sbc:
+        // FFmpeg selects joint stereo below 180 kbps, then -q:a sets the A2DP bitpool.
+        options = L" -af aresample=" + sampleRate + L",apad=pad_len=256 -c:a sbc -b:a 160k -q:a " +
+            std::to_wstring(profile.bitrate == 237 ? 33 : 51) + L" -f sbc";
+        break;
+    case Codec::Ldac: break;
+    }
+    return runFfmpeg(L"-y -i " + quote(track.wstring()) + L" -map 0:a:0 -map_metadata -1 -t 900.01 -ac 2 -ar " +
+        sampleRate + options + L" " + quote(output.wstring()), nullptr, stop);
+}
+
+AudioError decodeEncoded(const fs::path& path, const Profile& profile, int rate, std::vector<float>& samples,
+                         std::stop_token stop) {
+    switch (profile.codec) {
+    case Codec::Ldac: return decodeLdac(path, profile.sampleRate, rate, samples, stop);
+    case Codec::AptxHd:
+        return decode(path, rate, samples, stop, L"-f aptx_hd -sample_rate " + std::to_wstring(profile.sampleRate),
+                      L"-af atrim=start_sample=" + std::to_wstring(aptxHdDelay));
+    case Codec::Sbc:
+        return decode(path, rate, samples, stop, L"-f sbc", L"-af atrim=start_sample=" + std::to_wstring(sbcDelay));
+    default: return decode(path, rate, samples, stop);
+    }
+}
+
+EncodedAudioCache::Encoded requestEncodedAudio(EncodedAudioCache& cache, const fs::path& track, const Profile& profile, std::stop_token stop,
+                                               std::optional<TempFile>& output, AudioError& error) {
+    return cache.getOrEncode(track, profile, [&] {
+        output.emplace();
+        error = encodeAudio(track, profile, output->path, stop);
+        if (error) return EncodedAudioCache::Bytes {};
+        std::ifstream file(output->path, std::ios::binary | std::ios::ate);
+        const auto length = static_cast<std::streamoff>(file.tellg());
+        if (length <= 0) throw std::runtime_error("Could not read encoded audio");
+        EncodedAudioCache::Bytes bytes(static_cast<std::size_t>(length));
+        file.seekg(0);
+        if (!file.read(bytes.data(), length)) throw std::runtime_error("Could not read encoded audio");
+        return bytes;
+    }, stop);
 }
 
 void matchLevels(PreparedAudio& audio) {
@@ -220,31 +345,50 @@ void matchLevels(PreparedAudio& audio) {
 
 } // namespace
 
-std::shared_ptr<const EncodedMp3> preencodeMp3(const fs::path& track, const Profile& profile, std::stop_token stop) {
+void prefetchAudio(EncodedAudioCache& cache, const fs::path& track, const Profile& profile, std::stop_token stop) {
     try {
-        if (stop.stop_requested() || !fs::is_regular_file(track)) return {};
-        auto mp3 = std::make_shared<EncodedMp3>(track, profile, fs::last_write_time(track));
-        if (encodeMp3(track, profile, mp3->file.path, stop) || !mp3->matches(track, profile)) return {};
-        return mp3;
+        if (stop.stop_requested() || !fs::is_regular_file(track)) return;
+        std::optional<TempFile> output;
+        AudioError error;
+        requestEncodedAudio(cache, track, profile, stop, output, error);
     } catch (const std::exception&) {
-        return {};
+        // Foreground preparation can retry and report errors.
     }
 }
 
-PreparedResult prepareAudio(const fs::path& track, const Profile& profile, int rate, std::stop_token stop,
-                            std::shared_ptr<const EncodedMp3> prefetched) {
+PreparedResult prepareAudio(EncodedAudioCache& cache, const fs::path& track, const Profile& profile, int rate, std::stop_token stop) {
     try {
         if (!fs::is_regular_file(track)) return {{}, {AudioIssue::TrackMissing, {}}};
         auto audio = std::make_shared<PreparedAudio>();
+        std::error_code timestampError;
+        const auto modified = fs::last_write_time(track, timestampError);
+        if (!timestampError) audio->sourceWriteTime = modified;
         if (auto error = decode(track, rate, audio->samples[0], stop); error) return {{}, std::move(error)};
         if (audio->frames() > static_cast<std::size_t>(rate) * 900) return {{}, {AudioIssue::TrackTooLong, {}}};
-        std::optional<TempFile> mp3;
-        if (!prefetched || !prefetched->matches(track, profile)) {
-            mp3.emplace();
-            if (auto error = encodeMp3(track, profile, mp3->path, stop); error) return {{}, std::move(error)};
+        if (audio->frames() == 0) return {{}, {AudioIssue::Empty, {}}};
+        std::optional<TempFile> compressed;
+        {
+            AudioError error;
+            const auto encoded = requestEncodedAudio(cache, track, profile, stop, compressed, error);
+            if (!encoded) {
+                if (error) return {{}, std::move(error)};
+                return {{}, {stop.stop_requested() ? AudioIssue::Cancelled : AudioIssue::Io, {}}};
+            }
+            if (!compressed) {
+                // MP3 and AAC use container metadata for gapless playback from a seekable input.
+                compressed.emplace();
+                std::ofstream file(compressed->path, std::ios::binary | std::ios::trunc);
+                file.write(encoded->data(), static_cast<std::streamsize>(encoded->size()));
+                file.close();
+                if (!file) return {{}, {AudioIssue::Io, {}}};
+            }
         }
-        const auto& mp3Path = mp3 ? mp3->path : prefetched->file.path;
-        if (auto error = decode(mp3Path, rate, audio->samples[1], stop); error) return {{}, std::move(error)};
+        if (auto error = decodeEncoded(compressed->path, profile, rate, audio->samples[1], stop); error) {
+            return {{}, std::move(error)};
+        }
+        if (audio->sourceWriteTime && (fs::last_write_time(track, timestampError) != *audio->sourceWriteTime || timestampError)) {
+            return {{}, {AudioIssue::Io, {}}};
+        }
         const auto commonSize = std::min(audio->samples[0].size(), audio->samples[1].size());
         if (!commonSize) return {{}, {AudioIssue::Empty, {}}};
         for (auto& samples : audio->samples) samples.resize(commonSize);
