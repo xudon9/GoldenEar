@@ -53,6 +53,8 @@ Sony’s Best Effort mode can move among LDAC bitrates as the link changes. aptX
 
 Drag across the waveform to select a passage. You can also place the playhead at each boundary and use **Set loop start** and **Set loop end**, while playing or paused. Golden Ear highlights the selected range and repeats it at the same positions for A, B, and X. Use **Clear loop** to resume playback through the whole track. The loop stays selected between trials on the same song and clears when the song changes.
 
+When waveform inspection is allowed, use **View A/B waveforms** to open a resizable detail window. It opens on the whole song or the selected loop section. Use the magnifier buttons or mouse wheel to zoom in and out, **Whole song** to reset the range, or the bottom horizontal scrollbar to navigate the song. In ABX, only A and B are shown before answering. Identify Hi-Fi unlocks the button after the answer.
+
 ## Keyboard controls
 
 | Default key | Action |

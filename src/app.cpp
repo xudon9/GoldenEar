@@ -86,7 +86,7 @@ enum Control {
     PreferenceBase = 30, ModeBase = 40, DifficultyBase = 50, KeyBase = 70,
     ThemeBase = 80, LanguageBase = 90, RemoveBase = 100,
     RestartOnFinishOption = 110, ShuffleTracksOption, BackToSetup, ClearEncodedAudioCache, RandomSong, PickTrackBase = 120,
-    ProfileBase = 140, CodecBase = 160, LadderTrialCount = 170
+    ProfileBase = 140, CodecBase = 160, LadderTrialCount = 170, OpenWaveforms
 };
 
 enum class Panel { Main, Library, Preferences };
@@ -514,6 +514,17 @@ private:
     COLORREF buttonFace(Canvas& canvas, int id, RECT area, Style style, bool enabled);
     void sample(Canvas& canvas, int side, RECT area);
     void transport(Canvas& canvas, Player::State state);
+    bool canCompareWaveforms() const {
+        return session && (session->mode == Mode::Abx || session->mode == Mode::Preference || session->trial.response >= 0);
+    }
+    void openWaveformWindow();
+    void closeWaveformWindow();
+    void paintWaveformWindow();
+    void layoutWaveformScrollBar();
+    void updateWaveformScrollBar();
+    void zoomWaveform(bool zoomIn);
+    LRESULT waveformMessage(UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK waveformProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     void updateLanguage();
     void updateAppearance();
     void layoutLadderCountEdit();
@@ -588,6 +599,10 @@ private:
     bool tracking = false;
     bool dirty = true;
     bool wasPlaying = false;
+    HWND waveformWindow = nullptr;
+    HWND waveformScrollBar = nullptr;
+    std::size_t waveformViewStart = 0;
+    std::size_t waveformViewEnd = 0;
 
     static constexpr std::size_t pageSize = 8;
     static constexpr int timelineStart = 82;
@@ -646,6 +661,7 @@ void App::updateLanguage() {
 }
 
 App::~App() {
+    closeWaveformWindow();
     if (preparation.joinable()) {
         preparation.request_stop();
         preparation.join();
@@ -1053,6 +1069,287 @@ void App::transport(Canvas& canvas, Player::State state) {
                Style::Quiet, canChangeSong, Font::Small);
 }
 
+void App::openWaveformWindow() {
+    if (!active || !audio || !canCompareWaveforms()) return;
+    if (waveformWindow) {
+        ShowWindow(waveformWindow, SW_SHOWNORMAL);
+        SetForegroundWindow(waveformWindow);
+        return;
+    }
+    const auto frames = audio->frames();
+    waveformViewStart = clip ? clip->start : 0;
+    waveformViewEnd = clip ? clip->end : frames;
+    if (waveformViewStart >= waveformViewEnd || waveformViewEnd > frames) {
+        waveformViewStart = 0;
+        waveformViewEnd = frames;
+    }
+    const auto instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(window, GWLP_HINSTANCE));
+    static constexpr wchar_t className[] = L"GoldenEarWaveformWindow";
+    WNDCLASSEXW windowClass {};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.lpfnWndProc = waveformProcedure;
+    windowClass.hInstance = instance;
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
+    windowClass.lpszClassName = className;
+    RegisterClassExW(&windowClass);
+    waveformWindow = CreateWindowExW(0, className, std::wstring(t(Text::WaveformWindowTitle)).c_str(),
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 980, 620,
+        window, nullptr, instance, this);
+    if (!waveformWindow) return;
+    waveformScrollBar = CreateWindowExW(0, L"SCROLLBAR", nullptr, WS_CHILD | WS_VISIBLE | SBS_HORZ,
+        0, 0, 0, 0, waveformWindow, nullptr, instance, nullptr);
+    layoutWaveformScrollBar();
+    ShowWindow(waveformWindow, SW_SHOWNORMAL);
+    UpdateWindow(waveformWindow);
+    SetForegroundWindow(waveformWindow);
+}
+
+void App::closeWaveformWindow() {
+    const auto current = waveformWindow;
+    waveformWindow = nullptr;
+    if (waveformScrollBar) {
+        DestroyWindow(waveformScrollBar);
+        waveformScrollBar = nullptr;
+    }
+    if (current) DestroyWindow(current);
+}
+
+void App::layoutWaveformScrollBar() {
+    if (!waveformWindow || !waveformScrollBar) return;
+    RECT client {};
+    GetClientRect(waveformWindow, &client);
+    MoveWindow(waveformScrollBar, 28, std::max(0, static_cast<int>(client.bottom) - 48),
+               std::max(1, static_cast<int>(client.right) - 56), 18, TRUE);
+    updateWaveformScrollBar();
+}
+
+void App::updateWaveformScrollBar() {
+    if (!waveformScrollBar || !audio || audio->frames() == 0) return;
+    const auto frames = std::min<std::size_t>(audio->frames(), static_cast<std::size_t>(INT_MAX));
+    const auto span = std::min<std::size_t>(waveformViewEnd - waveformViewStart, frames);
+    SCROLLINFO info {};
+    info.cbSize = sizeof(info);
+    info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    info.nMin = 0;
+    info.nMax = static_cast<int>(frames - 1);
+    info.nPage = static_cast<UINT>(std::min<std::size_t>(span, static_cast<std::size_t>(UINT_MAX)));
+    info.nPos = static_cast<int>(std::min(waveformViewStart, frames - span));
+    SetScrollInfo(waveformScrollBar, SB_CTL, &info, TRUE);
+}
+
+void App::zoomWaveform(bool zoomIn) {
+    if (!audio || waveformViewEnd <= waveformViewStart) return;
+    const auto frames = audio->frames();
+    const auto span = waveformViewEnd - waveformViewStart;
+    const auto center = waveformViewStart + span / 2;
+    const auto nextSpan = zoomIn ? std::max<std::size_t>(1, span / 2) : std::min(frames, span > frames / 2 ? frames : span * 2);
+    waveformViewStart = center > nextSpan / 2 ? center - nextSpan / 2 : 0;
+    waveformViewEnd = std::min(frames, waveformViewStart + nextSpan);
+    waveformViewStart = waveformViewEnd > nextSpan ? waveformViewEnd - nextSpan : 0;
+    updateWaveformScrollBar();
+    InvalidateRect(waveformWindow, nullptr, FALSE);
+}
+
+void App::paintWaveformWindow() {
+    PAINTSTRUCT paintInfo {};
+    const auto target = BeginPaint(waveformWindow, &paintInfo);
+    RECT client {};
+    GetClientRect(waveformWindow, &client);
+    const auto memory = CreateCompatibleDC(target);
+    const auto bitmap = memory ? CreateCompatibleBitmap(target, client.right, client.bottom) : nullptr;
+    const auto dc = memory && bitmap ? memory : target;
+    if (memory && bitmap) SelectObject(memory, bitmap);
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    SelectObject(dc, GetStockObject(DC_PEN));
+    SetDCBrushColor(dc, colors.background);
+    FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    Canvas canvas(dc, fonts, colors);
+    const auto button = [&](RECT area, Text text) {
+        const auto fill = colors.surface;
+        canvas.box(area, fill, colors.line, 8);
+        canvas.label(t(text), area, Font::Small, colors.textColor, DT_CENTER);
+    };
+    const auto zoomButton = [&](RECT area, bool plus) {
+        canvas.box(area, colors.surface, colors.line, 8);
+        const int centerX = (area.left + area.right) / 2 - 3;
+        const int centerY = (area.top + area.bottom) / 2 - 3;
+        canvas.ellipse(rect(centerX - 8, centerY - 8, 16, 16), colors.surface, colors.textColor);
+        canvas.stroke(centerX + 4, centerY + 4, centerX + 11, centerY + 11, colors.textColor);
+        canvas.stroke(centerX - 4, centerY, centerX + 4, centerY, colors.textColor);
+        if (plus) canvas.stroke(centerX, centerY - 4, centerX, centerY + 4, colors.textColor);
+    };
+    zoomButton(rect(28, 14, 54, 34), true);
+    zoomButton(rect(90, 14, 54, 34), false);
+    button(rect(152, 14, 120, 34), Text::WholeSong);
+    const auto timeLabel = clockText(waveformViewStart, player.sampleRate(), true) + L"  –  " +
+        clockText(waveformViewEnd, player.sampleRate(), true);
+    canvas.label(timeLabel, rect(300, 14, std::max(1, static_cast<int>(client.right) - 328), 34), Font::Mono, colors.muted, DT_RIGHT);
+
+    const RECT waveArea {28, 62, std::max(29, static_cast<int>(client.right) - 28),
+                         std::max(63, static_cast<int>(client.bottom) - 58)};
+    canvas.box(waveArea, colors.surface, colors.line, 10);
+    if (!audio || waveformViewStart >= waveformViewEnd) {
+        if (memory && bitmap) {
+            BitBlt(target, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
+            DeleteObject(bitmap);
+            DeleteDC(memory);
+        } else if (memory) {
+            DeleteDC(memory);
+        }
+        EndPaint(waveformWindow, &paintInfo);
+        return;
+    }
+    const auto span = waveformViewEnd - waveformViewStart;
+    const int rowHeight = std::max(24, (static_cast<int>(waveArea.bottom - waveArea.top) - 28) / 2);
+    const int centers[] {waveArea.top + 14 + rowHeight / 2, waveArea.top + 14 + rowHeight + rowHeight / 2};
+    const int left = waveArea.left + 30;
+    const int right = waveArea.right - 12;
+    const int drawableWidth = std::max(1, right - left);
+    struct Peak { float low = 1; float high = -1; };
+    std::vector<std::array<Peak, 2>> peaks(static_cast<std::size_t>(drawableWidth));
+    float sharedPeak = 0;
+    for (int x = 0; x < drawableWidth; ++x) {
+        const auto begin = waveformViewStart + span * static_cast<std::size_t>(x) / drawableWidth;
+        const auto end = std::max(begin + 1, waveformViewStart + span * static_cast<std::size_t>(x + 1) / drawableWidth);
+        for (int side = 0; side < 2; ++side) {
+            auto& peak = peaks[static_cast<std::size_t>(x)][side];
+            peak.low = 1;
+            peak.high = -1;
+            const auto source = session->trial.source(side);
+            for (std::size_t frame = begin; frame < std::min(end, audio->frames()); ++frame) {
+                peak.low = std::min({peak.low, audio->samples[source][2 * frame], audio->samples[source][2 * frame + 1]});
+                peak.high = std::max({peak.high, audio->samples[source][2 * frame], audio->samples[source][2 * frame + 1]});
+            }
+            sharedPeak = std::max({sharedPeak, std::abs(peak.low), std::abs(peak.high)});
+        }
+    }
+    const int halfHeight = std::max(8, rowHeight / 2 - 8);
+    const double scale = sharedPeak > 0 ? halfHeight / sharedPeak : 0;
+    const auto state = player.state();
+    const auto labelColor = RGB(
+        (GetRValue(colors.accent) + GetRValue(colors.surface)) / 2,
+        (GetGValue(colors.accent) + GetGValue(colors.surface)) / 2,
+        (GetBValue(colors.accent) + GetBValue(colors.surface)) / 2);
+    for (int side = 0; side < 2; ++side) {
+        const int center = centers[side];
+        canvas.stroke(left, center, right, center, colors.line);
+        for (int x = 0; x < drawableWidth; ++x) {
+            const auto& peak = peaks[static_cast<std::size_t>(x)][side];
+            const int top = static_cast<int>(std::lround(peak.high * scale));
+            const int bottom = static_cast<int>(std::lround(-peak.low * scale));
+            const auto frame = waveformViewStart + span * static_cast<std::size_t>(x) / drawableWidth;
+            const auto ink = state.position >= frame && state.position <
+                waveformViewStart + span * static_cast<std::size_t>(x + 1) / drawableWidth ? colors.accent : colors.waveform;
+            canvas.stroke(left + x, center - top, left + x, center + bottom + 1, ink);
+        }
+        canvas.label(std::wstring(1, sideName(side)), rect(waveArea.left + 8, center - rowHeight / 2 + 2, 70, 48),
+                     Font::Hero, labelColor);
+    }
+    if (state.loop) {
+        const auto marker = [&](std::size_t frame) {
+            return left + static_cast<int>(std::clamp(frame, waveformViewStart, waveformViewEnd) - waveformViewStart) * drawableWidth /
+                static_cast<int>(span);
+        };
+        const int start = marker(state.loop->start);
+        const int end = marker(state.loop->end);
+        canvas.stroke(start, waveArea.top + 8, start, waveArea.bottom - 8, colors.accent);
+        canvas.stroke(end, waveArea.top + 8, end, waveArea.bottom - 8, colors.accent);
+    }
+    if (memory && bitmap) {
+        BitBlt(target, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
+        DeleteObject(bitmap);
+        DeleteDC(memory);
+    } else if (memory) {
+        DeleteDC(memory);
+    }
+    EndPaint(waveformWindow, &paintInfo);
+}
+
+LRESULT CALLBACK App::waveformProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* app = reinterpret_cast<App*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        app = static_cast<App*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
+        app->waveformWindow = window;
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+    }
+    return app ? app->waveformMessage(message, wParam, lParam) : DefWindowProcW(window, message, wParam, lParam);
+}
+
+LRESULT App::waveformMessage(UINT message, WPARAM wParam, LPARAM lParam) {
+    const auto current = waveformWindow;
+    switch (message) {
+    case WM_PAINT: paintWaveformWindow(); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_SIZE:
+        layoutWaveformScrollBar();
+        InvalidateRect(waveformWindow, nullptr, FALSE);
+        return 0;
+    case WM_MOUSEWHEEL:
+        zoomWaveform(GET_WHEEL_DELTA_WPARAM(wParam) > 0);
+        return 0;
+    case WM_HSCROLL: {
+        if (!waveformScrollBar || reinterpret_cast<HWND>(lParam) != waveformScrollBar || !audio) return 0;
+        const auto frames = audio->frames();
+        const auto span = std::min(waveformViewEnd - waveformViewStart, frames);
+        SCROLLINFO info {};
+        info.cbSize = sizeof(info);
+        info.fMask = SIF_ALL;
+        GetScrollInfo(waveformScrollBar, SB_CTL, &info);
+        auto position = static_cast<long long>(waveformViewStart);
+        const auto step = std::max<std::size_t>(1, span / 20);
+        switch (LOWORD(wParam)) {
+        case SB_LINELEFT: position -= static_cast<long long>(step); break;
+        case SB_LINERIGHT: position += static_cast<long long>(step); break;
+        case SB_PAGELEFT: position -= static_cast<long long>(span); break;
+        case SB_PAGERIGHT: position += static_cast<long long>(span); break;
+        case SB_TOP: position = 0; break;
+        case SB_BOTTOM: position = static_cast<long long>(frames - span); break;
+        case SB_THUMBTRACK: position = info.nTrackPos; break;
+        default: return 0;
+        }
+        position = std::clamp(position, 0LL, static_cast<long long>(frames - span));
+        waveformViewStart = static_cast<std::size_t>(position);
+        waveformViewEnd = waveformViewStart + span;
+        updateWaveformScrollBar();
+        InvalidateRect(waveformWindow, nullptr, FALSE);
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) { closeWaveformWindow(); return 0; }
+        break;
+    case WM_CLOSE: closeWaveformWindow(); return 0;
+    case WM_LBUTTONDOWN: return 0;
+    case WM_LBUTTONUP: {
+        const POINT point {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (point.y >= 14 && point.y < 48) {
+            RECT client {};
+            GetClientRect(waveformWindow, &client);
+            const auto frames = audio ? audio->frames() : 0;
+            if (point.x >= 28 && point.x < 82) {
+                zoomWaveform(true);
+            } else if (point.x >= 90 && point.x < 144) {
+                zoomWaveform(false);
+            } else if (point.x >= 152 && point.x < 272) {
+                waveformViewStart = 0;
+                waveformViewEnd = frames;
+                updateWaveformScrollBar();
+                InvalidateRect(waveformWindow, nullptr, FALSE);
+            }
+            return 0;
+        }
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK: return 0;
+    case WM_COMMAND: break;
+    }
+    if (message == WM_LBUTTONUP) return 0;
+    if (message == WM_NCDESTROY) {
+        waveformWindow = nullptr;
+    }
+    return DefWindowProcW(current, message, wParam, lParam);
+}
+
 void App::listening(Canvas& canvas) {
     const auto& s = *session;
     const auto& trial = s.trial;
@@ -1067,7 +1364,7 @@ void App::listening(Canvas& canvas) {
 
     if (audio) {
         const auto label = locale.format(Text::PlaybackFormat, locale.sampleRate(player.sampleRate()));
-        canvas.label(label, rect(66, 212, 650, 27), Font::Small, colors.muted);
+        canvas.label(label, rect(66, 212, 418, 27), Font::Small, colors.muted);
     } else if (error) {
         std::wstring message(t(audioMessage(error.issue)));
         if (!error.detail.empty()) message.append(L" ").append(error.detail);
@@ -1075,6 +1372,8 @@ void App::listening(Canvas& canvas) {
     } else {
         canvas.label(t(Text::Preparing), rect(66, 212, 650, 27), Font::Body, colors.muted);
     }
+    button(canvas, OpenWaveforms, rect(500, 207, 218, 35), t(Text::ViewWaveforms), Style::Quiet,
+           audio != nullptr && canCompareWaveforms(), Font::Small);
 
     const int sides = s.mode == Mode::Abx ? 3 : 2;
     const int sampleWidth = sides == 3 ? 210 : 320;
@@ -1346,6 +1645,7 @@ void App::advanceTrial(Advance action, bool autoplay, std::optional<std::size_t>
 
 void App::prepare(bool autoplay, bool reuseAudio) {
     if (!active || preparation.joinable()) return;
+    closeWaveformWindow();
     error = {};
     loopStart.reset();
     if (pressed == Seek && GetCapture() == window) ReleaseCapture();
@@ -1457,11 +1757,15 @@ void App::poll() {
         dirty |= state.playing || wasPlaying || state.failed;
         wasPlaying = state.playing;
     }
-    if (dirty) InvalidateRect(window, nullptr, FALSE);
+    if (dirty) {
+        InvalidateRect(window, nullptr, FALSE);
+        if (waveformWindow) InvalidateRect(waveformWindow, nullptr, FALSE);
+    }
 }
 
 void App::finish(bool restart) {
     if (!active) return;
+    closeWaveformWindow();
     lastTrack = trackPath(session->trial.track);
     restartPending = restart;
     requestedTrack.reset();
@@ -1567,6 +1871,7 @@ void App::click(int id) {
     case Finish: finish(settings.restartOnFinish); break;
     case BackToSetup: finish(false); break;
     case Retry: prepare(); break;
+    case OpenWaveforms: openWaveformWindow(); break;
     case Next: case NextAndPlay: case Skip: {
         if (!active || session->complete() || preparation.joinable()) break;
         const bool next = id == Next || id == NextAndPlay;
