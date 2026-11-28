@@ -62,6 +62,12 @@ EncodedAudioCache::Encoded EncodedAudioCache::getOrEncode(const fs::path& track,
     return stop.stop_requested() ? nullptr : encoded;
 }
 
+void EncodedAudioCache::setByteLimit(std::size_t limit) {
+    std::scoped_lock lock(mutex);
+    byteLimit = limit;
+    trim(byteLimit, entryLimit);
+}
+
 void EncodedAudioCache::clear() {
     std::scoped_lock lock(mutex);
     ++generation;
@@ -72,10 +78,14 @@ void EncodedAudioCache::clear() {
 void EncodedAudioCache::remember(const Key& key, const Encoded& encoded) {
     const auto bytes = encoded->capacity();
     if (bytes > byteLimit) return;
-    while (cachedBytes > byteLimit - bytes || entries.size() >= entryLimit) {
+    trim(byteLimit - bytes, entryLimit - 1);
+    entries.push_front({key, encoded});
+    cachedBytes += bytes;
+}
+
+void EncodedAudioCache::trim(std::size_t maxBytes, std::size_t maxEntries) {
+    while (cachedBytes > maxBytes || entries.size() > maxEntries) {
         cachedBytes -= entries.back().encoded->capacity();
         entries.pop_back();
     }
-    entries.push_front({key, encoded});
-    cachedBytes += bytes;
 }

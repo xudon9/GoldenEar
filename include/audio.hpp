@@ -6,6 +6,7 @@
 #include <mmsystem.h>
 #include <mmreg.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -17,12 +18,25 @@
 #include <thread>
 #include <vector>
 
+struct WaveformPeak {
+    float low = 1;
+    float high = -1;
+
+    void include(float minimum, float maximum) {
+        low = std::min(low, minimum);
+        high = std::max(high, maximum);
+    }
+};
+
 struct PreparedAudio {
     static constexpr std::size_t overviewSize = 128;
+    static constexpr std::size_t peakBlockFrames = 256;
     std::array<std::vector<float>, 2> samples;
     std::array<float, overviewSize> overview {};
+    std::array<std::vector<WaveformPeak>, 2> peakBlocks;
     std::optional<std::filesystem::file_time_type> sourceWriteTime;
     std::size_t frames() const { return samples[0].size() / 2; }
+    WaveformPeak waveformPeak(int source, std::size_t begin, std::size_t end) const;
 };
 
 enum class AudioIssue {

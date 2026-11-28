@@ -332,18 +332,58 @@ void matchLevels(PreparedAudio& audio) {
     }
     const float maxPeak = std::max(peak[0] * gain[0], peak[1] * gain[1]);
     const float headroom = maxPeak > 0.98f ? 0.98f / maxPeak : 1;
+    constexpr auto blockSize = PreparedAudio::peakBlockFrames;
     for (std::size_t side = 0; side < audio.samples.size(); ++side) {
-        for (float& sample : audio.samples[side]) sample *= gain[side] * headroom;
+        auto& samples = audio.samples[side];
+        auto& blocks = audio.peakBlocks[side];
+        const auto scale = gain[side] * headroom;
+        blocks.resize((audio.frames() + blockSize - 1) / blockSize);
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            const auto end = std::min((i + 1) * blockSize, audio.frames());
+            auto& block = blocks[i];
+            for (auto frame = i * blockSize; frame < end; ++frame) {
+                auto& left = samples[2 * frame];
+                auto& right = samples[2 * frame + 1];
+                left *= scale;
+                right *= scale;
+                block.include(std::min(left, right), std::max(left, right));
+            }
+        }
     }
 
     const auto& reference = audio.samples[0];
     for (std::size_t i = 0; i < reference.size(); i += 2) {
-        const auto bin = i * PreparedAudio::overviewSize / reference.size();
+        const auto bin = static_cast<std::uint64_t>(i) * PreparedAudio::overviewSize / reference.size();
         audio.overview[bin] = std::max({audio.overview[bin], std::abs(reference[i]), std::abs(reference[i + 1])});
     }
 }
 
 } // namespace
+
+WaveformPeak PreparedAudio::waveformPeak(int source, std::size_t begin, std::size_t end) const {
+    WaveformPeak peak;
+    const auto& data = samples[source];
+    const auto& blocks = peakBlocks[source];
+    const auto scan = [&](std::size_t until) {
+        for (; begin < until; ++begin) {
+            const auto left = data[2 * begin];
+            const auto right = data[2 * begin + 1];
+            peak.include(std::min(left, right), std::max(left, right));
+        }
+    };
+    // Use complete blocks for the interior. The edges need exact samples to stay within the view.
+    if (!blocks.empty()) {
+        const auto firstBlock = (begin + peakBlockFrames - 1) / peakBlockFrames;
+        const auto endBlock = end / peakBlockFrames;
+        scan(std::min(end, firstBlock * peakBlockFrames));
+        for (auto block = firstBlock; block < endBlock; ++block) {
+            peak.include(blocks[block].low, blocks[block].high);
+            begin += peakBlockFrames;
+        }
+    }
+    scan(end);
+    return peak;
+}
 
 void prefetchAudio(EncodedAudioCache& cache, const fs::path& track, const Profile& profile, std::stop_token stop) {
     try {

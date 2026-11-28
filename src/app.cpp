@@ -15,6 +15,7 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -84,23 +85,74 @@ COLORREF readableTextColor(COLORREF background) {
 }
 
 constexpr RECT rect(int x, int y, int w, int h) { return {x, y, x + w, y + h}; }
+constexpr auto panelArea = rect(39, 110, 705, 574);
+constexpr int secondaryPanelOffset = (width - panelArea.left - panelArea.right) / 2;
+
+constexpr std::size_t bytesPerMiB = 1024 * 1024;
+constexpr std::size_t maxCacheLimitMiB = std::numeric_limits<std::size_t>::max() / bytesPerMiB;
+
+template <class Char>
+std::optional<std::size_t> parseCacheLimit(std::basic_string_view<Char> text) {
+    if (text.empty()) return {};
+    std::size_t value = 0;
+    for (const auto ch : text) {
+        if (ch < '0' || ch > '9') return {};
+        const auto digit = static_cast<std::size_t>(ch - '0');
+        if (value > (maxCacheLimitMiB - digit) / 10) return {};
+        value = value * 10 + digit;
+    }
+    return value;
+}
+
+enum class WaveformControl { None, ZoomIn, ZoomOut, WholeSong, Plot, Scrollbar };
+
+struct WaveformLayout {
+    static constexpr RECT zoomIn = rect(16, 12, 38, 34);
+    static constexpr RECT zoomOut = rect(60, 12, 38, 34);
+    static constexpr RECT wholeSong = rect(110, 12, 124, 34);
+    static constexpr int laneGap = 8;
+    static constexpr int plotInset = 10;
+    RECT plot;
+    RECT scrollbar;
+
+    explicit WaveformLayout(HWND window) {
+        RECT client {};
+        GetClientRect(window, &client);
+        const int right = std::max(37L, client.right - 16);
+        plot = {16, 56, right, std::max(114L, client.bottom - 32)};
+        scrollbar = {16, plot.bottom + 6, right, plot.bottom + 24};
+    }
+
+    int plotWidth() const { return plot.right - plot.left - 2 * plotInset; }
+    int scrollWidth() const { return scrollbar.right - scrollbar.left; }
+
+    WaveformControl controlAt(POINT point) const {
+        if (PtInRect(&zoomIn, point)) return WaveformControl::ZoomIn;
+        if (PtInRect(&zoomOut, point)) return WaveformControl::ZoomOut;
+        if (PtInRect(&wholeSong, point)) return WaveformControl::WholeSong;
+        if (PtInRect(&plot, point)) return WaveformControl::Plot;
+        if (PtInRect(&scrollbar, point)) return WaveformControl::Scrollbar;
+        return WaveformControl::None;
+    }
+};
 
 enum Shortcut { HearA, HearB, HearX, ToggleAB, Play, Back, Forward, AnswerA, AnswerB, KeyCount };
-constexpr std::array<int, KeyCount> defaultKeys {'J', 'K', 'L', VK_OEM_1, VK_SPACE, VK_OEM_COMMA, VK_OEM_PERIOD, '1', '2'};
+constexpr std::array<int, KeyCount> defaultKeys {'J', 'K', 'L', VK_OEM_1, VK_SPACE, VK_OEM_COMMA, VK_OEM_PERIOD, 'U', 'I'};
 constexpr std::array<Text, KeyCount> shortcutNames {
     Text::ListenA, Text::ListenB, Text::ListenX, Text::ToggleAB, Text::PlayPause,
     Text::SeekBack, Text::SeekForward, Text::AnswerA, Text::AnswerB
 };
-constexpr std::array modeNames {Text::Abx, Text::Identify, Text::Preference};
+constexpr std::array modeNames {Text::Abx, Text::Identify};
 
 enum Control {
-    Library = 1, Preferences, Import, Start, Finish, Skip, ChooseSong, Next, Retry, Seek,
+    Home = 1, Library, Preferences, Import, Start, Finish, Skip, ChooseSong, Next, Retry, Seek,
     PlayPause, Rewind, FastForward, SelectA, SelectB, SelectX, Toggle, SubmitA, SubmitB,
-    PreviousPage, NextPage, ClosePanel, ResetKeys, ToggleBundled, MarkLoop, ClearLoop, NextAndPlay, TogglePractice,
+    PreviousPage, NextPage, ResetKeys, ToggleBundled, MarkLoop, ClearLoop, NextAndPlay, TogglePractice,
     PreferenceBase = 30, ModeBase = 40, DifficultyBase = 50, KeyBase = 70,
     ThemeBase = 80, LanguageBase = 90, RemoveBase = 100,
     RestartOnFinishOption = 110, ShuffleTracksOption, BackToSetup, ClearEncodedAudioCache, RandomSong, PickTrackBase = 120,
-    ProfileBase = 140, CodecBase = 160, LadderTrialCount = 170, AccentColorButton, ResetAccentColor, OpenWaveforms
+    ProfileBase = 140, CodecBase = 160, LadderTrialCount = 170, AccentColorButton, ResetAccentColor, OpenWaveforms,
+    CacheLimitEdit, ApplyCacheLimit
 };
 
 enum class Panel { Main, Library, Preferences };
@@ -118,7 +170,7 @@ enum class TransportIcon { Play, Pause, Rewind, FastForward };
 // These glyphs are shared by Segoe Fluent Icons and Segoe MDL2 Assets.
 enum class ActionIcon : wchar_t {
     Settings = L'\uE713', Repertoire = L'\uE90B', Import = L'\uE8B5', Play = L'\uE768', Next = L'\uE72A', Back = L'\uE72B',
-    Delete = L'\uE74D', Shuffle = L'\uE8B1'
+    Delete = L'\uE74D', Shuffle = L'\uE8B1', Home = L'\uE80F'
 };
 enum class ControlRole { Action, Checkbox, Radio };
 
@@ -232,11 +284,14 @@ std::vector<BundledTrack> loadBundledTracks() {
 }
 
 struct Settings {
+    static constexpr auto currentVersion = "GoldenEar11";
+
     std::vector<fs::path> tracks;
     std::array<int, KeyCount> keys = defaultKeys;
     Mode mode = Mode::Abx;
     Difficulty difficulty = Difficulty::Random;
     unsigned trialsPerLevel = Session::defaultTrialsPerLevel;
+    std::size_t cacheLimitMiB = EncodedAudioCache::defaultByteLimit / bytesPerMiB;
     Codec codec = Codec::Mp3;
     unsigned enabled = (1U << profiles.size()) - 1;
     LanguageSetting language = LanguageSetting::Auto;
@@ -265,7 +320,9 @@ struct Settings {
         std::ifstream in(file);
         std::string version;
         if (!(in >> version)) return;
-        const bool hasAccent = version == "GoldenEar9";
+        const bool hasCacheLimit = version == currentVersion;
+        const bool hasNewShortcutDefaults = hasCacheLimit || version == "GoldenEar10";
+        const bool hasAccent = hasNewShortcutDefaults || version == "GoldenEar9";
         const bool hasTrialsPerLevel = hasAccent || version == "GoldenEar8";
         const bool hasCodecs = hasTrialsPerLevel || version == "GoldenEar7";
         const bool hasSessionOptions = hasCodecs || version == "GoldenEar6";
@@ -276,7 +333,7 @@ struct Settings {
         int savedDifficulty = 0;
         unsigned savedEnabled = 0;
         if (!(in >> savedMode >> savedDifficulty >> savedEnabled)) return;
-        if (savedMode >= 0 && savedMode <= 2) mode = static_cast<Mode>(savedMode);
+        if (savedMode == 1 || savedMode == 2) mode = Mode::Identify; // Saved Preference mode becomes Identify Hi-Fi.
         if (savedDifficulty >= 0 && savedDifficulty <= 1) difficulty = static_cast<Difficulty>(savedDifficulty);
         for (const Codec candidate : codecs) {
             if (!hasCodecs && candidate != Codec::Mp3) break;
@@ -318,13 +375,22 @@ struct Settings {
                 trialsPerLevel = savedTrialsPerLevel;
             }
         }
+        if (hasCacheLimit) {
+            std::string savedLimit;
+            if (!(in >> savedLimit)) return;
+            if (const auto limit = parseCacheLimit(std::string_view(savedLimit))) cacheLimitMiB = *limit;
+        }
         auto savedKeys = keys;
         std::vector<int> read;
         for (auto& key : savedKeys) {
             if (!(in >> key)) return;
             if (bindable(key) && std::find(read.begin(), read.end(), key) == read.end()) read.push_back(key);
         }
-        if (read.size() == keys.size()) keys = savedKeys;
+        // Migrate the old stock layout as a unit so custom bindings keep their assignments.
+        auto legacyDefaults = defaultKeys;
+        legacyDefaults[AnswerA] = '1';
+        legacyDefaults[AnswerB] = '2';
+        if (read.size() == keys.size() && (hasNewShortcutDefaults || savedKeys != legacyDefaults)) keys = savedKeys;
         for (std::string path; in >> std::quoted(path);) {
             try {
                 tracks.emplace_back(std::u8string(path.begin(), path.end()));
@@ -342,10 +408,11 @@ struct Settings {
         auto temp = file;
         temp += L".new";
         std::ofstream out(temp, std::ios::trunc);
-        out << "GoldenEar9\n" << static_cast<int>(mode) << ' ' << static_cast<int>(difficulty) << ' ' << enabled
+        out << currentVersion << '\n' << static_cast<int>(mode) << ' ' << static_cast<int>(difficulty) << ' ' << enabled
             << ' ' << languageCode(language) << ' ' << includeBundled << ' ' << static_cast<int>(theme)
             << ' ' << (accentColor ? 1 : 0) << ' ' << static_cast<unsigned>(accentColor.value_or(0)) << ' ' << practice
-            << ' ' << restartOnFinish << ' ' << shuffleTracks << ' ' << static_cast<int>(codec) << ' ' << trialsPerLevel << '\n';
+            << ' ' << restartOnFinish << ' ' << shuffleTracks << ' ' << static_cast<int>(codec) << ' ' << trialsPerLevel
+            << ' ' << cacheLimitMiB << '\n';
         for (int key : keys) out << key << ' ';
         out << '\n';
         for (const auto& path : tracks) {
@@ -383,6 +450,13 @@ public:
     Canvas(HDC dc, const std::array<HFONT, static_cast<std::size_t>(Font::Count)>& fonts, const Palette& colors)
         : dc(dc), fonts(fonts), colors(colors) {
         SetBkMode(dc, TRANSPARENT);
+    }
+
+    void offsetX(int x) const { OffsetWindowOrgEx(dc, -x, 0, nullptr); }
+
+    void icon(HICON icon, RECT area) const {
+        if (icon) DrawIconEx(dc, area.left, area.top, icon, area.right - area.left, area.bottom - area.top,
+                             0, nullptr, DI_NORMAL);
     }
 
     void box(RECT area, COLORREF fill, COLORREF border, int radius = 12) const {
@@ -538,21 +612,23 @@ private:
     void sample(Canvas& canvas, int side, RECT area);
     void transport(Canvas& canvas, Player::State state);
     bool canCompareWaveforms() const {
-        return session && (session->mode == Mode::Abx || session->mode == Mode::Preference || session->trial.response >= 0);
+        return session && (session->mode == Mode::Abx || session->trial.response >= 0);
     }
     void openWaveformWindow();
     void closeWaveformWindow();
     void paintWaveformWindow();
-    void layoutWaveformScrollBar();
-    void updateWaveformScrollBar();
+    RECT waveformThumb(const WaveformLayout& layout) const;
+    void setWaveformView(std::size_t start, std::size_t span);
     void zoomWaveform(bool zoomIn);
+    void panWaveform(int x, const WaveformLayout& layout);
     LRESULT waveformMessage(UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK waveformProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     void updateLanguage();
     void updateAppearance();
     void chooseAccentColor();
-    void layoutLadderCountEdit();
+    void layoutNumberEdits();
     void readLadderCount();
+    void readCacheLimit();
     std::wstring_view t(Text id) const { return locale.get(id); }
     std::wstring profileLabel(const Profile& profile) const;
     std::wstring_view scenarioLabel(const Profile& profile) const;
@@ -580,9 +656,11 @@ private:
     void setLoop(std::optional<LoopRange> range);
 
     HWND window = nullptr;
+    HICON headerIcon = nullptr;
     HWND ladderCountEdit = nullptr;
-    HFONT ladderCountFont = nullptr;
-    int ladderCountFontHeight = 0;
+    HWND cacheLimitEdit = nullptr;
+    HFONT numberEditFont = nullptr;
+    int numberEditFontHeight = 0;
     std::array<HFONT, static_cast<std::size_t>(Font::Count)> fonts {};
     Palette colors = lightColors;
     Settings settings;
@@ -616,6 +694,7 @@ private:
     std::optional<std::size_t> requestedTrack;
     std::optional<LoopRange> clip;
     std::optional<std::size_t> loopStart;
+    std::optional<std::size_t> draftCacheLimitMiB;
     bool active = false;
     bool validLadderCount = true;
     bool restartPending = false;
@@ -624,19 +703,25 @@ private:
     bool dirty = true;
     bool wasPlaying = false;
     HWND waveformWindow = nullptr;
-    HWND waveformScrollBar = nullptr;
     std::size_t waveformViewStart = 0;
     std::size_t waveformViewEnd = 0;
+    WaveformControl waveformPressed = WaveformControl::None;
+    int waveformDragX = 0;
+    std::size_t waveformDragFrame = 0;
+    int waveformWheelDelta = 0;
 
     static constexpr std::size_t pageSize = 8;
     static constexpr int timelineStart = 82;
     static constexpr int timelineEnd = 702;
     static constexpr RECT seekArea = rect(timelineStart - 5, 398, timelineEnd - timelineStart + 11, 51);
     static constexpr RECT ladderCountArea = rect(635, 340, 82, 27);
+    static constexpr RECT cacheLimitArea = rect(443, 427, 145, 35);
 };
 
 App::App() {
     settings.load();
+    draftCacheLimitMiB = settings.cacheLimitMiB;
+    encodedAudioCache.setByteLimit(settings.cacheLimitMiB * bytesPerMiB);
     updateLanguage();
 }
 
@@ -661,13 +746,16 @@ void App::updateAppearance() {
     }
 
     const BOOL darkFrame = dark;
-    DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkFrame, sizeof(darkFrame));
     const bool overrideCaption = settings.theme != ThemeSetting::System && !highContrast;
     const COLORREF caption = overrideCaption ? colors.background : DWMWA_COLOR_DEFAULT;
     const COLORREF title = overrideCaption ? colors.textColor : DWMWA_COLOR_DEFAULT;
-    DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR, &caption, sizeof(caption));
-    DwmSetWindowAttribute(window, DWMWA_TEXT_COLOR, &title, sizeof(title));
-    RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+    for (const HWND target : {window, waveformWindow}) {
+        if (!target) continue;
+        DwmSetWindowAttribute(target, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkFrame, sizeof(darkFrame));
+        DwmSetWindowAttribute(target, DWMWA_CAPTION_COLOR, &caption, sizeof(caption));
+        DwmSetWindowAttribute(target, DWMWA_TEXT_COLOR, &title, sizeof(title));
+        RedrawWindow(target, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+    }
 }
 
 void App::updateLanguage() {
@@ -717,27 +805,32 @@ App::~App() {
         preparation.join();
     }
     for (HFONT font : fonts) DeleteObject(font);
-    if (ladderCountFont) DeleteObject(ladderCountFont);
+    if (numberEditFont) DeleteObject(numberEditFont);
+    if (headerIcon) DestroyIcon(headerIcon);
 }
 
-void App::layoutLadderCountEdit() {
-    if (!ladderCountEdit) return;
+void App::layoutNumberEdits() {
+    if (!ladderCountEdit || !cacheLimitEdit) return;
     const auto layout = Layout::forWindow(window);
     const int fontHeight = std::max(1, MulDiv(16, layout.h, height));
-    if (fontHeight != ladderCountFontHeight) {
+    if (fontHeight != numberEditFontHeight) {
         const auto font = CreateFontW(-fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
         if (font) {
             SendMessageW(ladderCountEdit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-            if (ladderCountFont) DeleteObject(ladderCountFont);
-            ladderCountFont = font;
-            ladderCountFontHeight = fontHeight;
+            SendMessageW(cacheLimitEdit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            if (numberEditFont) DeleteObject(numberEditFont);
+            numberEditFont = font;
+            numberEditFontHeight = fontHeight;
         }
     }
-    const int x = layout.x + MulDiv(ladderCountArea.left + 4, layout.w, width);
-    const int y = layout.y + MulDiv(ladderCountArea.top + 4, layout.h, height);
-    MoveWindow(ladderCountEdit, x, y, MulDiv(ladderCountArea.right - ladderCountArea.left - 8, layout.w, width),
-               MulDiv(ladderCountArea.bottom - ladderCountArea.top - 7, layout.h, height), TRUE);
+    const auto place = [&](HWND edit, RECT area, int offset) {
+        const int x = layout.x + MulDiv(area.left + offset + 4, layout.w, width);
+        const int y = layout.y + MulDiv((area.top + area.bottom - 20) / 2, layout.h, height);
+        MoveWindow(edit, x, y, MulDiv(area.right - area.left - 8, layout.w, width), MulDiv(20, layout.h, height), TRUE);
+    };
+    place(ladderCountEdit, ladderCountArea, 0);
+    place(cacheLimitEdit, cacheLimitArea, secondaryPanelOffset);
 }
 
 void App::readLadderCount() {
@@ -750,6 +843,17 @@ void App::readLadderCount() {
     if (validLadderCount && settings.trialsPerLevel != count) {
         settings.trialsPerLevel = static_cast<unsigned>(count);
         save();
+    }
+    dirty = true;
+}
+
+void App::readCacheLimit() {
+    wchar_t input[std::numeric_limits<std::size_t>::digits10 + 2] {};
+    const int length = GetWindowTextLengthW(cacheLimitEdit);
+    draftCacheLimitMiB.reset();
+    if (length > 0 && length < static_cast<int>(std::size(input)) &&
+        GetWindowTextW(cacheLimitEdit, input, static_cast<int>(std::size(input))) == length) {
+        draftCacheLimitMiB = parseCacheLimit(std::wstring_view(input, length));
     }
     dirty = true;
 }
@@ -836,39 +940,45 @@ std::wstring_view App::scenarioLabel(const Profile& profile) const {
 
 void App::draw(Canvas& canvas) {
     hits.clear();
-    canvas.box(rect(39, 27, 35, 35), colors.primary, colors.primary, 9);
-    for (int i = 0; i < 5; ++i) {
-        constexpr int amplitudes[] = {4, 8, 11, 7, 4};
-        canvas.stroke(47 + 5 * i, 44 - amplitudes[i], 47 + 5 * i, 45 + amplitudes[i], colors.primaryText);
-        canvas.stroke(48 + 5 * i, 44 - amplitudes[i], 48 + 5 * i, 45 + amplitudes[i], colors.primaryText);
-    }
+    canvas.icon(headerIcon ? headerIcon : reinterpret_cast<HICON>(GetClassLongPtrW(window, GCLP_HICON)), rect(36, 24, 42, 42));
     canvas.label(L"Golden Ear", rect(86, 19, 268, 38), Font::Title);
     canvas.label(t(Text::Tagline), rect(88, 57, 268, 18), Font::Small, colors.muted);
+    iconButton(canvas, Home, rect(607, 26, 170, 40), ActionIcon::Home,
+               t(Text::Home), panel == Panel::Main ? Style::Selected : Style::Quiet);
     iconButton(canvas, Library, rect(789, 26, 170, 40), ActionIcon::Repertoire,
                t(Text::Repertoire), panel == Panel::Library ? Style::Selected : Style::Quiet);
     iconButton(canvas, Preferences, rect(971, 26, 170, 40), ActionIcon::Settings,
                t(Text::Preferences), panel == Panel::Preferences ? Style::Selected : Style::Quiet);
     canvas.stroke(39, 91, 1141, 91, colors.line);
-    canvas.box(rect(39, 110, 705, 574), colors.surface, colors.line, 17);
-    canvas.box(rect(762, 110, 379, 574), colors.surface, colors.line, 17);
-
-    if (panel == Panel::Library) library(canvas);
-    else if (panel == Panel::Preferences) preferences(canvas);
-    else if (active) listening(canvas);
-    else setup(canvas);
-
-    results(canvas);
+    if (panel == Panel::Main) {
+        canvas.box(panelArea, colors.surface, colors.line, 17);
+        canvas.box(rect(762, 110, 379, 574), colors.surface, colors.line, 17);
+        if (active) listening(canvas);
+        else setup(canvas);
+        results(canvas);
+    } else {
+        // The secondary tabs share the existing panel layout, centered without the results column.
+        const auto firstHit = hits.size();
+        canvas.offsetX(secondaryPanelOffset);
+        pointer.x -= secondaryPanelOffset;
+        canvas.box(panelArea, colors.surface, colors.line, 17);
+        if (panel == Panel::Library) library(canvas);
+        else preferences(canvas);
+        pointer.x += secondaryPanelOffset;
+        canvas.offsetX(-secondaryPanelOffset);
+        for (std::size_t i = firstHit; i < hits.size(); ++i) OffsetRect(&hits[i].area, secondaryPanelOffset, 0);
+    }
     if (!status.empty()) canvas.label(status, rect(40, 697, 1101, 25), Font::Small, colors.muted);
 }
 
 void App::setup(Canvas& canvas) {
     canvas.label(t(session ? Text::AnotherSession : Text::ListeningTestSetup), rect(64, 127, 654, 46), Font::Hero);
     canvas.label(t(Text::TestType), rect(65, 181, 650, 24), Font::Bold);
-    for (int i = 0; i < 3; ++i) {
-        choice(canvas, {ModeBase + i, rect(65 + i * 221, 207, 211, 37), ControlRole::Radio,
+    for (int i = 0; i < static_cast<int>(modeNames.size()); ++i) {
+        choice(canvas, {ModeBase + i, rect(65 + i * 331, 207, 321, 37), ControlRole::Radio,
                        static_cast<int>(settings.mode) == i, ModeBase}, t(modeNames[i]));
     }
-    constexpr std::array descriptions {Text::AbxDescription, Text::IdentifyDescription, Text::PreferenceDescription};
+    constexpr std::array descriptions {Text::AbxDescription, Text::IdentifyDescription};
     canvas.label(t(descriptions[static_cast<std::size_t>(settings.mode)]), rect(65, 246, 650, 22), Font::Small, colors.muted);
     canvas.label(t(Text::Difficulty), rect(65, 275, 650, 24), Font::Bold);
     choice(canvas, {DifficultyBase, rect(65, 301, 321, 37), ControlRole::Radio,
@@ -934,15 +1044,14 @@ void App::results(Canvas& canvas) {
     } else {
         canvas.label(t(practice ? Text::PracticeMode : Text::NoScores), rect(787, 174, 330, 26), Font::Small, colors.muted);
     }
-    const bool preference = session ? session->mode == Mode::Preference : settings.mode == Mode::Preference;
     canvas.stroke(787, 215, 1116, 215, colors.line);
     const auto codec = session ? profiles[session->enabled.front()].codec : settings.codec;
     canvas.label(locale.format(Text::ProfileColumn, codecName(codec)), rect(787, 227, 150, 23), Font::Small, colors.muted);
     if (practice) {
         canvas.label(t(Text::AnswersColumn), rect(1016, 227, 100, 23), Font::Small, colors.muted, DT_RIGHT);
     } else {
-        canvas.label(t(preference ? Text::PreferenceColumn : Text::CorrectColumn), rect(933, 227, 81, 23), Font::Small, colors.muted, DT_CENTER);
-        canvas.label(t(preference ? Text::ShareColumn : Text::PValueColumn), rect(1016, 227, 100, 23), Font::Small, colors.muted, DT_RIGHT);
+        canvas.label(t(Text::CorrectColumn), rect(933, 227, 81, 23), Font::Small, colors.muted, DT_CENTER);
+        canvas.label(t(Text::PValueColumn), rect(1016, 227, 100, 23), Font::Small, colors.muted, DT_RIGHT);
     }
     int y = 254;
     for (std::size_t i = 0; i < profiles.size(); ++i) {
@@ -961,11 +1070,11 @@ void App::results(Canvas& canvas) {
             const auto& score = session->scores[i];
             const double p = score.adjustedP(session->enabled.size());
             canvas.label(std::to_wstring(score.correct) + L" / " + std::to_wstring(score.total), rect(933, y + 2, 81, 27), Font::Mono, colors.textColor, DT_CENTER);
-            if (!preference) canvas.label(percent(score.correct, score.total), rect(933, y + 26, 81, 19), Font::Small, colors.muted, DT_CENTER);
-            canvas.label(preference ? percent(score.correct, score.total) : locale.pValue(p), rect(1016, y + 2, 100, 27), Font::Mono,
-                         !preference && p <= 0.05 ? colors.accent : colors.textColor, DT_RIGHT);
-            if (!preference) canvas.label(t(p <= 0.05 ? Text::AboveChance : Text::Inconclusive), rect(1016, y + 26, 100, 19), Font::Small,
-                                         p <= 0.05 ? colors.accent : colors.muted, DT_RIGHT);
+            canvas.label(percent(score.correct, score.total), rect(933, y + 26, 81, 19), Font::Small, colors.muted, DT_CENTER);
+            canvas.label(locale.pValue(p), rect(1016, y + 2, 100, 27), Font::Mono,
+                         p <= 0.05 ? colors.accent : colors.textColor, DT_RIGHT);
+            canvas.label(t(p <= 0.05 ? Text::AboveChance : Text::Inconclusive), rect(1016, y + 26, 100, 19), Font::Small,
+                         p <= 0.05 ? colors.accent : colors.muted, DT_RIGHT);
         } else {
             canvas.label(L"—", rect(933, y + 4, 81, 30), Font::Mono, colors.muted, DT_CENTER);
             canvas.label(L"—", rect(1016, y + 4, 100, 30), Font::Mono, colors.muted, DT_RIGHT);
@@ -978,14 +1087,14 @@ void App::results(Canvas& canvas) {
         const auto counts = locale.format(Text::TrialCounts, s.answered, s.skipped, s.replaced);
         canvas.label(counts, rect(787, 517, 330, 24), Font::Small, colors.muted);
     }
-    if (!practice) canvas.paragraph(t(preference ? Text::PreferenceHelp : Text::PValueHelp),
+    if (!practice) canvas.paragraph(t(Text::PValueHelp),
                                    rect(787, 551, 330, 46), Font::Small);
     if (active) {
         const bool complete = session->complete();
         if (settings.restartOnFinish) {
             button(canvas, Finish, rect(787, 601, 330, 33), t(complete ? Text::RestartSession : Text::FinishAndRestart), Style::Quiet);
         }
-        if (!complete || panel != Panel::Main) {
+        if (!complete) {
             iconButton(canvas, BackToSetup, rect(787, settings.restartOnFinish ? 641 : 613, 330, settings.restartOnFinish ? 33 : 43),
                        ActionIcon::Back, t(Text::BackToSetup), Style::Quiet);
         }
@@ -1010,7 +1119,10 @@ void App::sample(Canvas& canvas, int side, RECT area) {
     std::wstring label(t(side == 2 ? Text::UnknownSample : Text::ReferenceSample));
     std::wstring_view scenario;
     const auto& trial = session->trial;
-    if (session->practice) {
+    if (side == 2 && trial.response >= 0) {
+        label = L"= ";
+        label += sideName(trial.match);
+    } else if (session->practice || trial.response >= 0) {
         const auto& profile = profiles[trial.profile];
         if (trial.source(side) == 0) {
             label = t(Text::LosslessSource);
@@ -1023,7 +1135,7 @@ void App::sample(Canvas& canvas, int side, RECT area) {
     const int labelWidth = area.right - area.left - 32;
     canvas.label(label, rect(area.left + 19, area.top + (scenario.empty() ? 73 : 67), labelWidth, 20), Font::Small, sampleInk);
     if (!scenario.empty()) canvas.label(scenario, rect(area.left + 19, area.top + 86, labelWidth, 18), Font::Small, sampleInk);
-    if (trial.response >= 0 && session->mode != Mode::Preference) {
+    if (trial.response >= 0) {
         const bool correct = side == trial.answer(session->mode);
         if (correct || side == trial.response) canvas.answerMark(rect(area.right - 46, area.top + 44, 32, 32), correct);
     }
@@ -1122,7 +1234,7 @@ void App::transport(Canvas& canvas, Player::State state) {
 void App::openWaveformWindow() {
     if (!active || !audio || !canCompareWaveforms()) return;
     if (waveformWindow) {
-        ShowWindow(waveformWindow, SW_SHOWNORMAL);
+        if (IsIconic(waveformWindow)) ShowWindow(waveformWindow, SW_RESTORE);
         SetForegroundWindow(waveformWindow);
         return;
     }
@@ -1140,6 +1252,8 @@ void App::openWaveformWindow() {
     windowClass.lpfnWndProc = waveformProcedure;
     windowClass.hInstance = instance;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hIcon = reinterpret_cast<HICON>(GetClassLongPtrW(window, GCLP_HICON));
+    windowClass.hIconSm = reinterpret_cast<HICON>(GetClassLongPtrW(window, GCLP_HICONSM));
     windowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
     windowClass.lpszClassName = className;
     RegisterClassExW(&windowClass);
@@ -1147,45 +1261,37 @@ void App::openWaveformWindow() {
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 980, 620,
         window, nullptr, instance, this);
     if (!waveformWindow) return;
-    waveformScrollBar = CreateWindowExW(0, L"SCROLLBAR", nullptr, WS_CHILD | WS_VISIBLE | SBS_HORZ,
-        0, 0, 0, 0, waveformWindow, nullptr, instance, nullptr);
-    layoutWaveformScrollBar();
+    updateAppearance();
     ShowWindow(waveformWindow, SW_SHOWNORMAL);
     UpdateWindow(waveformWindow);
     SetForegroundWindow(waveformWindow);
 }
 
 void App::closeWaveformWindow() {
-    const auto current = waveformWindow;
-    waveformWindow = nullptr;
-    if (waveformScrollBar) {
-        DestroyWindow(waveformScrollBar);
-        waveformScrollBar = nullptr;
-    }
-    if (current) DestroyWindow(current);
+    if (waveformWindow) DestroyWindow(waveformWindow);
 }
 
-void App::layoutWaveformScrollBar() {
-    if (!waveformWindow || !waveformScrollBar) return;
-    RECT client {};
-    GetClientRect(waveformWindow, &client);
-    MoveWindow(waveformScrollBar, 28, std::max(0, static_cast<int>(client.bottom) - 48),
-               std::max(1, static_cast<int>(client.right) - 56), 18, TRUE);
-    updateWaveformScrollBar();
+RECT App::waveformThumb(const WaveformLayout& layout) const {
+    const auto frames = audio->frames();
+    const auto span = waveformViewEnd - waveformViewStart;
+    const int width = layout.scrollWidth();
+    const int thumbWidth = static_cast<int>(std::clamp<std::uint64_t>(
+        static_cast<std::uint64_t>(width) * span / frames, std::min(36, width), width));
+    const auto scrollable = frames - span;
+    const int offset = scrollable ? static_cast<int>(
+        static_cast<std::uint64_t>(width - thumbWidth) * waveformViewStart / scrollable) : 0;
+    return rect(layout.scrollbar.left + offset, layout.scrollbar.top, thumbWidth, layout.scrollbar.bottom - layout.scrollbar.top);
 }
 
-void App::updateWaveformScrollBar() {
-    if (!waveformScrollBar || !audio || audio->frames() == 0) return;
-    const auto frames = std::min<std::size_t>(audio->frames(), static_cast<std::size_t>(INT_MAX));
-    const auto span = std::min<std::size_t>(waveformViewEnd - waveformViewStart, frames);
-    SCROLLINFO info {};
-    info.cbSize = sizeof(info);
-    info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-    info.nMin = 0;
-    info.nMax = static_cast<int>(frames - 1);
-    info.nPage = static_cast<UINT>(std::min<std::size_t>(span, static_cast<std::size_t>(UINT_MAX)));
-    info.nPos = static_cast<int>(std::min(waveformViewStart, frames - span));
-    SetScrollInfo(waveformScrollBar, SB_CTL, &info, TRUE);
+void App::setWaveformView(std::size_t start, std::size_t span) {
+    if (!audio || !audio->frames()) return;
+    const auto frames = audio->frames();
+    span = std::clamp(span, std::size_t {1}, frames);
+    start = std::min(start, frames - span);
+    if (start == waveformViewStart && start + span == waveformViewEnd) return;
+    waveformViewStart = start;
+    waveformViewEnd = start + span;
+    InvalidateRect(waveformWindow, nullptr, FALSE);
 }
 
 void App::zoomWaveform(bool zoomIn) {
@@ -1193,12 +1299,26 @@ void App::zoomWaveform(bool zoomIn) {
     const auto frames = audio->frames();
     const auto span = waveformViewEnd - waveformViewStart;
     const auto center = waveformViewStart + span / 2;
-    const auto nextSpan = zoomIn ? std::max<std::size_t>(1, span / 2) : std::min(frames, span > frames / 2 ? frames : span * 2);
-    waveformViewStart = center > nextSpan / 2 ? center - nextSpan / 2 : 0;
-    waveformViewEnd = std::min(frames, waveformViewStart + nextSpan);
-    waveformViewStart = waveformViewEnd > nextSpan ? waveformViewEnd - nextSpan : 0;
-    updateWaveformScrollBar();
-    InvalidateRect(waveformWindow, nullptr, FALSE);
+    const auto nextSpan = zoomIn ? std::max<std::size_t>(1, span / 2) : span + std::min(span, frames - span);
+    setWaveformView(center - std::min(center, nextSpan / 2), nextSpan);
+}
+
+void App::panWaveform(int x, const WaveformLayout& layout) {
+    if (!audio || waveformViewEnd <= waveformViewStart) return;
+    const auto span = waveformViewEnd - waveformViewStart;
+    const auto available = static_cast<long long>(audio->frames() - span);
+    if (!available) return;
+    const auto delta = static_cast<long long>(x) - waveformDragX;
+    auto start = static_cast<long long>(waveformDragFrame);
+    if (waveformPressed == WaveformControl::Plot) {
+        start -= delta * static_cast<long long>(span) / layout.plotWidth();
+    } else {
+        const auto thumb = waveformThumb(layout);
+        const int travel = layout.scrollWidth() - (thumb.right - thumb.left);
+        if (travel <= 0) return;
+        start += delta * available / travel;
+    }
+    setWaveformView(static_cast<std::size_t>(std::clamp(start, 0LL, available)), span);
 }
 
 void App::paintWaveformWindow() {
@@ -1208,111 +1328,109 @@ void App::paintWaveformWindow() {
     GetClientRect(waveformWindow, &client);
     const auto memory = CreateCompatibleDC(target);
     const auto bitmap = memory ? CreateCompatibleBitmap(target, client.right, client.bottom) : nullptr;
-    const auto dc = memory && bitmap ? memory : target;
-    if (memory && bitmap) SelectObject(memory, bitmap);
+    const auto dc = bitmap ? memory : target;
+    const auto previousBitmap = bitmap ? SelectObject(memory, bitmap) : nullptr;
     SelectObject(dc, GetStockObject(DC_BRUSH));
     SelectObject(dc, GetStockObject(DC_PEN));
     SetDCBrushColor(dc, colors.background);
     FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
     Canvas canvas(dc, fonts, colors);
-    const auto button = [&](RECT area, Text text) {
-        const auto fill = colors.surface;
-        canvas.box(area, fill, colors.line, 8);
-        canvas.label(t(text), area, Font::Small, colors.textColor, DT_CENTER);
-    };
-    const auto zoomButton = [&](RECT area, bool plus) {
-        canvas.box(area, colors.surface, colors.line, 8);
-        const int centerX = (area.left + area.right) / 2 - 3;
-        const int centerY = (area.top + area.bottom) / 2 - 3;
-        canvas.ellipse(rect(centerX - 8, centerY - 8, 16, 16), colors.surface, colors.textColor);
-        canvas.stroke(centerX + 4, centerY + 4, centerX + 11, centerY + 11, colors.textColor);
-        canvas.stroke(centerX - 4, centerY, centerX + 4, centerY, colors.textColor);
-        if (plus) canvas.stroke(centerX, centerY - 4, centerX, centerY + 4, colors.textColor);
-    };
-    zoomButton(rect(28, 14, 54, 34), true);
-    zoomButton(rect(90, 14, 54, 34), false);
-    button(rect(152, 14, 120, 34), Text::WholeSong);
-    const auto timeLabel = clockText(waveformViewStart, player.sampleRate(), true) + L"  –  " +
-        clockText(waveformViewEnd, player.sampleRate(), true);
-    canvas.label(timeLabel, rect(300, 14, std::max(1, static_cast<int>(client.right) - 328), 34), Font::Mono, colors.muted, DT_RIGHT);
-
-    const RECT waveArea {28, 62, std::max(29, static_cast<int>(client.right) - 28),
-                         std::max(63, static_cast<int>(client.bottom) - 58)};
-    canvas.box(waveArea, colors.surface, colors.line, 10);
-    if (!audio || waveformViewStart >= waveformViewEnd) {
-        if (memory && bitmap) {
-            BitBlt(target, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
-            DeleteObject(bitmap);
-            DeleteDC(memory);
-        } else if (memory) {
-            DeleteDC(memory);
-        }
-        EndPaint(waveformWindow, &paintInfo);
-        return;
-    }
+    const WaveformLayout layout(waveformWindow);
     const auto span = waveformViewEnd - waveformViewStart;
-    const int rowHeight = std::max(24, (static_cast<int>(waveArea.bottom - waveArea.top) - 28) / 2);
-    const int centers[] {waveArea.top + 14 + rowHeight / 2, waveArea.top + 14 + rowHeight + rowHeight / 2};
-    const int left = waveArea.left + 30;
-    const int right = waveArea.right - 12;
-    const int drawableWidth = std::max(1, right - left);
-    struct Peak { float low = 1; float high = -1; };
-    std::vector<std::array<Peak, 2>> peaks(static_cast<std::size_t>(drawableWidth));
-    float sharedPeak = 0;
-    for (int x = 0; x < drawableWidth; ++x) {
-        const auto begin = waveformViewStart + span * static_cast<std::size_t>(x) / drawableWidth;
-        const auto end = std::max(begin + 1, waveformViewStart + span * static_cast<std::size_t>(x + 1) / drawableWidth);
-        for (int side = 0; side < 2; ++side) {
-            auto& peak = peaks[static_cast<std::size_t>(x)][side];
-            peak.low = 1;
-            peak.high = -1;
-            const auto source = session->trial.source(side);
-            for (std::size_t frame = begin; frame < std::min(end, audio->frames()); ++frame) {
-                peak.low = std::min({peak.low, audio->samples[source][2 * frame], audio->samples[source][2 * frame + 1]});
-                peak.high = std::max({peak.high, audio->samples[source][2 * frame], audio->samples[source][2 * frame + 1]});
-            }
-            sharedPeak = std::max({sharedPeak, std::abs(peak.low), std::abs(peak.high)});
-        }
-    }
-    const int halfHeight = std::max(8, rowHeight / 2 - 8);
-    const double scale = sharedPeak > 0 ? halfHeight / sharedPeak : 0;
-    const auto state = player.state();
-    const auto labelColor = RGB(
-        (GetRValue(colors.accent) + GetRValue(colors.surface)) / 2,
-        (GetGValue(colors.accent) + GetGValue(colors.surface)) / 2,
-        (GetBValue(colors.accent) + GetBValue(colors.surface)) / 2);
-    for (int side = 0; side < 2; ++side) {
-        const int center = centers[side];
-        canvas.stroke(left, center, right, center, colors.line);
-        for (int x = 0; x < drawableWidth; ++x) {
-            const auto& peak = peaks[static_cast<std::size_t>(x)][side];
-            const int top = static_cast<int>(std::lround(peak.high * scale));
-            const int bottom = static_cast<int>(std::lround(-peak.low * scale));
-            const auto frame = waveformViewStart + span * static_cast<std::size_t>(x) / drawableWidth;
-            const auto ink = state.position >= frame && state.position <
-                waveformViewStart + span * static_cast<std::size_t>(x + 1) / drawableWidth ? colors.accent : colors.waveform;
-            canvas.stroke(left + x, center - top, left + x, center + bottom + 1, ink);
-        }
-        canvas.label(std::wstring(1, sideName(side)), rect(waveArea.left + 8, center - rowHeight / 2 + 2, 70, 48),
-                     Font::Hero, labelColor);
-    }
-    if (state.loop) {
-        const auto marker = [&](std::size_t frame) {
-            return left + static_cast<int>(std::clamp(frame, waveformViewStart, waveformViewEnd) - waveformViewStart) * drawableWidth /
-                static_cast<int>(span);
+    const bool ready = audio && span > 0;
+    const bool zoomed = ready && span < audio->frames();
+    const auto buttonFace = [&](RECT area, WaveformControl control, bool enabled) {
+        const auto fill = enabled && waveformPressed == control ? colors.selected : colors.surface;
+        canvas.box(area, fill, colors.line, 10);
+        return std::pair {fill, enabled ? colors.textColor : colors.disabled};
+    };
+    const auto magnifier = [&](RECT area, WaveformControl control, bool plus, bool enabled) {
+        const auto [fill, ink] = buttonFace(area, control, enabled);
+        const int x = (area.left + area.right) / 2 - 2;
+        const int y = (area.top + area.bottom) / 2 - 2;
+        canvas.ellipse(rect(x - 7, y - 7, 14, 14), fill, ink);
+        canvas.stroke(x + 5, y + 5, x + 10, y + 10, ink);
+        canvas.stroke(x - 3, y, x + 4, y, ink);
+        if (plus) canvas.stroke(x, y - 3, x, y + 4, ink);
+    };
+    magnifier(layout.zoomIn, WaveformControl::ZoomIn, true, ready && span > 1);
+    magnifier(layout.zoomOut, WaveformControl::ZoomOut, false, zoomed);
+    const auto reset = buttonFace(layout.wholeSong, WaveformControl::WholeSong, zoomed);
+    canvas.label(t(Text::WholeSong), layout.wholeSong, Font::Small, reset.second, DT_CENTER);
+    if (ready) {
+        const auto rate = player.sampleRate();
+        const auto timeLabel = clockText(waveformViewStart, rate, true) + L"  –  " + clockText(waveformViewEnd, rate, true);
+        canvas.label(timeLabel, rect(248, 12, std::max(1L, client.right - 264), 34), Font::Mono, colors.muted, DT_RIGHT);
+
+        const int width = layout.plotWidth();
+        const int left = layout.plot.left + layout.plotInset;
+        const int right = left + width;
+        const int rowHeight = (layout.plot.bottom - layout.plot.top - layout.laneGap) / 2;
+        const auto frameAt = [&](int x) {
+            return waveformViewStart + static_cast<std::uint64_t>(span) * x / width;
         };
-        const int start = marker(state.loop->start);
-        const int end = marker(state.loop->end);
-        canvas.stroke(start, waveArea.top + 8, start, waveArea.bottom - 8, colors.accent);
-        canvas.stroke(end, waveArea.top + 8, end, waveArea.bottom - 8, colors.accent);
+        const auto xAt = [&](std::size_t frame) {
+            return left + static_cast<int>(static_cast<std::uint64_t>(frame - waveformViewStart) * (width - 1) / span);
+        };
+
+        std::vector<std::array<WaveformPeak, 2>> peaks(static_cast<std::size_t>(width));
+        const int sources[] {session->trial.source(0), session->trial.source(1)};
+        float sharedPeak = 0;
+        for (int x = 0; x < width; ++x) {
+            const auto begin = static_cast<std::size_t>(frameAt(x));
+            const auto end = std::max(begin + 1, static_cast<std::size_t>(frameAt(x + 1)));
+            for (int side = 0; side < 2; ++side) {
+                const auto peak = audio->waveformPeak(sources[side], begin, end);
+                peaks[x][side] = peak;
+                sharedPeak = std::max({sharedPeak, -peak.low, peak.high});
+            }
+        }
+        const double scale = sharedPeak > 0 ? (rowHeight / 2 - 9) / static_cast<double>(sharedPeak) : 0;
+        const auto state = player.state();
+        const auto guides = blendColor(colors.line, colors.surface, 48);
+        const auto overlayInk = blendColor(colors.accent, colors.surface, 50);
+        for (int side = 0; side < 2; ++side) {
+            const int top = layout.plot.top + side * (rowHeight + layout.laneGap);
+            const int center = top + rowHeight / 2;
+            canvas.box(rect(layout.plot.left, top, layout.plot.right - layout.plot.left, rowHeight),
+                       colors.surface, colors.line, 12);
+            for (int tick = 1; tick < 4; ++tick) {
+                const int x = left + width * tick / 4;
+                canvas.stroke(x, top + 10, x, top + rowHeight - 10, guides);
+            }
+            canvas.stroke(left, center, right, center, colors.line);
+            for (int x = 0; x < width; ++x) {
+                const auto& peak = peaks[x][side];
+                const int high = static_cast<int>(std::lround(peak.high * scale));
+                const int low = static_cast<int>(std::lround(peak.low * scale));
+                canvas.stroke(left + x, center - high, left + x, center - low + 1, colors.waveform);
+            }
+            const auto mark = [&](std::size_t frame, COLORREF ink) {
+                if (frame < waveformViewStart || frame > waveformViewEnd) return;
+                const int x = xAt(frame);
+                canvas.stroke(x, top + 8, x, top + rowHeight - 8, ink);
+            };
+            if (state.loop) {
+                mark(state.loop->start, colors.clipWaveform);
+                mark(state.loop->end, colors.clipWaveform);
+            }
+            mark(state.position, colors.accent);
+            canvas.label(std::wstring(1, sideName(side)), rect(left + 4, top + 4, 40, 42), Font::Hero, overlayInk);
+        }
+
+        const auto rail = layout.scrollbar;
+        canvas.box({rail.left, rail.top + 5, rail.right, rail.bottom - 5}, colors.line, colors.line, 8);
+        const auto thumb = waveformThumb(layout);
+        const auto fill = waveformPressed == WaveformControl::Scrollbar ? colors.accent : colors.selectedBorder;
+        canvas.box({thumb.left, thumb.top + 3, thumb.right, thumb.bottom - 3},
+                   zoomed ? fill : colors.line, zoomed ? colors.muted : colors.line, 10);
     }
-    if (memory && bitmap) {
+    if (bitmap) {
         BitBlt(target, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
+        SelectObject(memory, previousBitmap);
         DeleteObject(bitmap);
-        DeleteDC(memory);
-    } else if (memory) {
-        DeleteDC(memory);
     }
+    if (memory) DeleteDC(memory);
     EndPaint(waveformWindow, &paintInfo);
 }
 
@@ -1328,74 +1446,121 @@ LRESULT CALLBACK App::waveformProcedure(HWND window, UINT message, WPARAM wParam
 
 LRESULT App::waveformMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     const auto current = waveformWindow;
+    const auto span = waveformViewEnd - waveformViewStart;
+    const auto frames = audio ? audio->frames() : 0;
+    const bool canPan = span > 0 && span < frames;
     switch (message) {
     case WM_PAINT: paintWaveformWindow(); return 0;
     case WM_ERASEBKGND: return 1;
-    case WM_SIZE:
-        layoutWaveformScrollBar();
-        InvalidateRect(waveformWindow, nullptr, FALSE);
-        return 0;
-    case WM_MOUSEWHEEL:
-        zoomWaveform(GET_WHEEL_DELTA_WPARAM(wParam) > 0);
-        return 0;
-    case WM_HSCROLL: {
-        if (!waveformScrollBar || reinterpret_cast<HWND>(lParam) != waveformScrollBar || !audio) return 0;
-        const auto frames = audio->frames();
-        const auto span = std::min(waveformViewEnd - waveformViewStart, frames);
-        SCROLLINFO info {};
-        info.cbSize = sizeof(info);
-        info.fMask = SIF_ALL;
-        GetScrollInfo(waveformScrollBar, SB_CTL, &info);
-        auto position = static_cast<long long>(waveformViewStart);
-        const auto step = std::max<std::size_t>(1, span / 20);
-        switch (LOWORD(wParam)) {
-        case SB_LINELEFT: position -= static_cast<long long>(step); break;
-        case SB_LINERIGHT: position += static_cast<long long>(step); break;
-        case SB_PAGELEFT: position -= static_cast<long long>(span); break;
-        case SB_PAGERIGHT: position += static_cast<long long>(span); break;
-        case SB_TOP: position = 0; break;
-        case SB_BOTTOM: position = static_cast<long long>(frames - span); break;
-        case SB_THUMBTRACK: position = info.nTrackPos; break;
-        default: return 0;
-        }
-        position = std::clamp(position, 0LL, static_cast<long long>(frames - span));
-        waveformViewStart = static_cast<std::size_t>(position);
-        waveformViewEnd = waveformViewStart + span;
-        updateWaveformScrollBar();
-        InvalidateRect(waveformWindow, nullptr, FALSE);
+    case WM_SIZE: InvalidateRect(current, nullptr, FALSE); return 0;
+    case WM_GETMINMAXINFO: {
+        const auto limits = reinterpret_cast<MINMAXINFO*>(lParam);
+        limits->ptMinTrackSize = {460, 300};
         return 0;
     }
-    case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) { closeWaveformWindow(); return 0; }
-        break;
-    case WM_CLOSE: closeWaveformWindow(); return 0;
-    case WM_LBUTTONDOWN: return 0;
-    case WM_LBUTTONUP: {
-        const POINT point {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        if (point.y >= 14 && point.y < 48) {
-            RECT client {};
-            GetClientRect(waveformWindow, &client);
-            const auto frames = audio ? audio->frames() : 0;
-            if (point.x >= 28 && point.x < 82) {
-                zoomWaveform(true);
-            } else if (point.x >= 90 && point.x < 144) {
-                zoomWaveform(false);
-            } else if (point.x >= 152 && point.x < 272) {
-                waveformViewStart = 0;
-                waveformViewEnd = frames;
-                updateWaveformScrollBar();
-                InvalidateRect(waveformWindow, nullptr, FALSE);
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCLIENT && canPan) {
+            POINT point {};
+            GetCursorPos(&point);
+            ScreenToClient(current, &point);
+            const auto control = WaveformLayout(current).controlAt(point);
+            if (waveformPressed == WaveformControl::Plot || waveformPressed == WaveformControl::Scrollbar) {
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                return TRUE;
             }
-            return 0;
+            if (control == WaveformControl::Plot || control == WaveformControl::Scrollbar) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
+        }
+        break;
+    case WM_MOUSEWHEEL:
+        if (waveformPressed == WaveformControl::None) {
+            waveformWheelDelta += GET_WHEEL_DELTA_WPARAM(wParam);
+            while (std::abs(waveformWheelDelta) >= WHEEL_DELTA) {
+                const bool zoomIn = waveformWheelDelta > 0;
+                zoomWaveform(zoomIn);
+                waveformWheelDelta += zoomIn ? -WHEEL_DELTA : WHEEL_DELTA;
+            }
         }
         return 0;
+    case WM_KEYDOWN: {
+        if (wParam == VK_ESCAPE) { closeWaveformWindow(); return 0; }
+        if (waveformPressed != WaveformControl::None) return 0;
+        const auto step = std::max<std::size_t>(1, span / 20);
+        switch (wParam) {
+        case VK_OEM_PLUS: case VK_ADD: zoomWaveform(true); return 0;
+        case VK_OEM_MINUS: case VK_SUBTRACT: zoomWaveform(false); return 0;
+        case VK_LEFT: setWaveformView(waveformViewStart - std::min(step, waveformViewStart), span); return 0;
+        case VK_RIGHT: setWaveformView(waveformViewStart + step, span); return 0;
+        case VK_PRIOR: setWaveformView(waveformViewStart - std::min(span, waveformViewStart), span); return 0;
+        case VK_NEXT: setWaveformView(waveformViewEnd, span); return 0;
+        case VK_HOME: setWaveformView(0, span); return 0;
+        case VK_END: setWaveformView(frames, span); return 0;
+        }
+        break;
     }
-    case WM_LBUTTONDBLCLK: return 0;
-    case WM_COMMAND: break;
+    case WM_CLOSE: closeWaveformWindow(); return 0;
+    case WM_LBUTTONDOWN: {
+        if (!span || !frames) return 0;
+        const WaveformLayout layout(current);
+        const POINT point {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const auto control = layout.controlAt(point);
+        if (control == WaveformControl::None ||
+            (!canPan && control != WaveformControl::ZoomIn) ||
+            (control == WaveformControl::ZoomIn && span == 1)) return 0;
+        if (control == WaveformControl::Scrollbar) {
+            const auto thumb = waveformThumb(layout);
+            if (point.x < thumb.left) {
+                setWaveformView(waveformViewStart - std::min(span, waveformViewStart), span);
+                return 0;
+            }
+            if (point.x >= thumb.right) {
+                setWaveformView(waveformViewEnd, span);
+                return 0;
+            }
+        }
+        SetFocus(current);
+        SetCapture(current);
+        waveformPressed = control;
+        waveformDragX = point.x;
+        waveformDragFrame = waveformViewStart;
+        InvalidateRect(current, nullptr, FALSE);
+        return 0;
     }
-    if (message == WM_LBUTTONUP) return 0;
-    if (message == WM_NCDESTROY) {
+    case WM_MOUSEMOVE:
+        if (waveformPressed == WaveformControl::Plot || waveformPressed == WaveformControl::Scrollbar) {
+            panWaveform(GET_X_LPARAM(lParam), WaveformLayout(current));
+        }
+        return 0;
+    case WM_LBUTTONUP: {
+        if (waveformPressed == WaveformControl::None) return 0;
+        const WaveformLayout layout(current);
+        const POINT point {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const auto pressed = waveformPressed;
+        if (pressed == WaveformControl::Plot || pressed == WaveformControl::Scrollbar) panWaveform(point.x, layout);
+        waveformPressed = WaveformControl::None;
+        if (GetCapture() == current) ReleaseCapture();
+        if (layout.controlAt(point) == pressed) {
+            if (pressed == WaveformControl::ZoomIn) zoomWaveform(true);
+            if (pressed == WaveformControl::ZoomOut) zoomWaveform(false);
+            if (pressed == WaveformControl::WholeSong) setWaveformView(0, frames);
+        }
+        InvalidateRect(current, nullptr, FALSE);
+        return 0;
+    }
+    case WM_CANCELMODE:
+        if (GetCapture() == current) ReleaseCapture();
+        return 0;
+    case WM_CAPTURECHANGED:
+        waveformPressed = WaveformControl::None;
+        InvalidateRect(current, nullptr, FALSE);
+        return 0;
+    case WM_NCDESTROY:
         waveformWindow = nullptr;
+        waveformPressed = WaveformControl::None;
+        waveformWheelDelta = 0;
+        break;
     }
     return DefWindowProcW(current, message, wParam, lParam);
 }
@@ -1432,25 +1597,12 @@ void App::listening(Canvas& canvas) {
     canvas.stroke(66, 571, 718, 571, colors.line);
 
     if (trial.response >= 0) {
-        std::wstring headline;
-        auto feedbackColor = colors.accent;
-        if (s.mode == Mode::Preference) {
-            headline = locale.format(Text::PreferenceAnswer, sideName(trial.response), sideName(trial.lossless));
-        } else {
-            const bool correct = trial.response == trial.answer(s.mode);
-            feedbackColor = correct ? colors.successColor : colors.errorColor;
-            headline = t(correct ? Text::Correct : Text::Incorrect);
-            headline += L' ';
-            headline += s.mode == Mode::Abx ? locale.format(Text::AbxAnswer, sideName(trial.match), sideName(trial.lossless)) :
-                locale.format(Text::IdentifyAnswer, sideName(trial.lossless));
-        }
-        canvas.label(headline, rect(66, 579, 648, 31), Font::Bold, feedbackColor);
-        if (!s.practice) {
-            const auto& profile = profiles[trial.profile];
-            auto label = std::wstring(codecName(profile.codec)) + L"  ·  " + profileLabel(profile);
-            if (profile.scenario != Scenario::None) label.append(L"  ·  ").append(scenarioLabel(profile));
-            canvas.label(label, rect(66, 619, 426, 41), Font::Body, colors.muted);
-        }
+        const bool correct = trial.response == trial.answer(s.mode);
+        std::wstring headline(t(correct ? Text::Correct : Text::Incorrect));
+        headline += L' ';
+        headline += s.mode == Mode::Abx ? locale.format(Text::AbxAnswer, sideName(trial.match), sideName(trial.lossless)) :
+            locale.format(Text::IdentifyAnswer, sideName(trial.lossless));
+        canvas.label(headline, rect(66, 579, 648, 31), Font::Bold, correct ? colors.successColor : colors.errorColor);
         if (s.complete()) {
             iconButton(canvas, BackToSetup, rect(506, 620, 212, 43), ActionIcon::Back, t(Text::BackToSetup), Style::Primary);
         } else {
@@ -1460,8 +1612,7 @@ void App::listening(Canvas& canvas) {
         return;
     }
 
-    constexpr std::array questions {Text::AbxQuestion, Text::IdentifyQuestion, Text::PreferenceQuestion};
-    canvas.label(t(questions[static_cast<std::size_t>(s.mode)]), rect(66, 579, 398, 28), Font::Bold);
+    canvas.label(t(s.mode == Mode::Abx ? Text::AbxQuestion : Text::IdentifyQuestion), rect(66, 579, 398, 28), Font::Bold);
     const bool idle = !preparation.joinable();
     if (error) {
         button(canvas, Retry, rect(66, 617, 285, 45), t(Text::Retry), Style::Primary, idle);
@@ -1516,7 +1667,6 @@ void App::library(Canvas& canvas) {
         choice(canvas, {ToggleBundled, rect(66, 611, 310, 42), ControlRole::Checkbox, settings.includeBundled},
                t(Text::ShowBundledTracks));
     }
-    button(canvas, ClosePanel, rect(active ? 618 : 418, 611, 100, 42), t(Text::Done), active ? Style::Primary : Style::Quiet);
     if (!active) iconButton(canvas, Import, rect(528, 611, 190, 42), ActionIcon::Import, t(Text::ImportAudio), Style::Primary);
 }
 
@@ -1540,7 +1690,6 @@ void App::preferences(Canvas& canvas) {
     case PreferencePage::Shortcuts: shortcuts(canvas); break;
     case PreferencePage::Session: sessionOptions(canvas); break;
     }
-    button(canvas, ClosePanel, rect(602, 611, 116, 42), t(Text::Done), Style::Primary);
 }
 
 void App::sessionOptions(Canvas& canvas) {
@@ -1550,8 +1699,18 @@ void App::sessionOptions(Canvas& canvas) {
     choice(canvas, {ShuffleTracksOption, rect(66, 343, 652, 59), ControlRole::Checkbox, settings.shuffleTracks},
            t(Text::ShuffleTracks), t(Text::ShuffleTracksHelp));
     canvas.stroke(66, 411, 718, 411, colors.line);
-    canvas.label(t(Text::ClearEncodedAudioCacheHelp), rect(75, 427, 373, 42), Font::Small, colors.muted);
-    iconButton(canvas, ClearEncodedAudioCache, rect(466, 427, 252, 42), ActionIcon::Delete, t(Text::ClearEncodedAudioCache), Style::Quiet);
+    canvas.label(t(Text::AudioCacheLimit), rect(75, 427, 353, 35), Font::Bold);
+    const auto border = !draftCacheLimitMiB ? colors.errorColor : focused == CacheLimitEdit ? colors.accent : colors.line;
+    canvas.box(cacheLimitArea, colors.raised, border, 5);
+    hits.push_back({CacheLimitEdit, cacheLimitArea});
+    button(canvas, ApplyCacheLimit, rect(602, 427, 116, 35), t(Text::ApplyCacheLimit), Style::Primary,
+           draftCacheLimitMiB && *draftCacheLimitMiB != settings.cacheLimitMiB);
+    const auto help = draftCacheLimitMiB ? std::wstring(t(Text::AudioCacheLimitHelp))
+                                           : locale.format(Text::AudioCacheLimitInvalid, maxCacheLimitMiB);
+    canvas.label(help, rect(75, 465, 643, 25), Font::Small, draftCacheLimitMiB ? colors.muted : colors.errorColor);
+    canvas.stroke(66, 499, 718, 499, colors.line);
+    canvas.label(t(Text::ClearEncodedAudioCacheHelp), rect(75, 512, 373, 42), Font::Small, colors.muted);
+    iconButton(canvas, ClearEncodedAudioCache, rect(466, 512, 252, 42), ActionIcon::Delete, t(Text::ClearEncodedAudioCache), Style::Quiet);
 }
 
 void App::appearance(Canvas& canvas) {
@@ -1751,7 +1910,8 @@ void App::prefetchNextAudio() {
     try {
         const auto next = session->previewNext();
         const auto& current = session->trial;
-        const bool needsEncode = next && (next->track != current.track || next->profile != current.profile);
+        const bool needsEncode = settings.cacheLimitMiB != 0 && next &&
+                                 (next->track != current.track || next->profile != current.profile);
         if (nextEncoded) {
             if (needsEncode && nextEncoded->track == next->track && nextEncoded->profile == next->profile &&
                 !nextEncoded->worker.get_stop_token().stop_requested()) return;
@@ -1887,21 +2047,22 @@ void App::setLoop(std::optional<LoopRange> range) {
 void App::click(int id) {
     status.clear();
     switch (id) {
+    case Home: panel = Panel::Main; capturing = -1; break;
     case ChooseSong: case Library:
-        panel = id == Library && panel == Panel::Library ? Panel::Main : Panel::Library;
+        if (panel != Panel::Library || id == ChooseSong) page = active ? session->trial.track / pageSize : 0;
+        panel = Panel::Library;
         capturing = -1;
-        page = active ? session->trial.track / pageSize : 0;
         break;
     case RandomSong:
         if (active && session->trackCount > 1) selectTrack(session->randomOtherTrack());
         break;
     case Preferences:
-        panel = panel == Panel::Preferences ? Panel::Main : Panel::Preferences;
+        panel = Panel::Preferences;
         capturing = -1;
         break;
-    case ClosePanel: panel = Panel::Main; capturing = -1; break;
     case Import: importTracks(); break;
     case LadderTrialCount: SetFocus(ladderCountEdit); break;
+    case CacheLimitEdit: SetFocus(cacheLimitEdit); break;
     case TogglePractice: if (!active) { settings.practice = !settings.practice; save(); } break;
     case RestartOnFinishOption:
         settings.restartOnFinish = !settings.restartOnFinish;
@@ -1915,6 +2076,14 @@ void App::click(int id) {
             if (audio) prefetchNextAudio();
         }
         save();
+        break;
+    case ApplyCacheLimit:
+        if (draftCacheLimitMiB && *draftCacheLimitMiB != settings.cacheLimitMiB) {
+            settings.cacheLimitMiB = *draftCacheLimitMiB;
+            encodedAudioCache.setByteLimit(settings.cacheLimitMiB * bytesPerMiB);
+            if (active && (audio || settings.cacheLimitMiB == 0)) prefetchNextAudio();
+            save();
+        }
         break;
     case ClearEncodedAudioCache:
         if (nextEncoded) {
@@ -1980,7 +2149,7 @@ void App::click(int id) {
         if (id >= PreferenceBase && id < PreferenceBase + static_cast<int>(preferencePages.size())) {
             preferencePage = static_cast<PreferencePage>(id - PreferenceBase);
             capturing = -1;
-        } else if (id >= ModeBase && id < ModeBase + 3 && !active) {
+        } else if (id >= ModeBase && id < ModeBase + static_cast<int>(modeNames.size()) && !active) {
             settings.mode = static_cast<Mode>(id - ModeBase);
             save();
         } else if (id >= DifficultyBase && id < DifficultyBase + 2 && !active) {
@@ -2034,10 +2203,11 @@ void App::navigate(bool backwards) {
         const auto& next = hits[index];
         if (next.role == ControlRole::Radio && !next.checked) continue;
         focused = next.id;
-        if (focused == LadderTrialCount) {
-            SetFocus(ladderCountEdit);
-            SendMessageW(ladderCountEdit, EM_SETSEL, 0, -1);
-        } else if (GetFocus() == ladderCountEdit) {
+        const auto edit = focused == LadderTrialCount ? ladderCountEdit : focused == CacheLimitEdit ? cacheLimitEdit : nullptr;
+        if (edit) {
+            SetFocus(edit);
+            SendMessageW(edit, EM_SETSEL, 0, -1);
+        } else if (GetFocus() == ladderCountEdit || GetFocus() == cacheLimitEdit) {
             SetFocus(window);
         }
         dirty = true;
@@ -2071,7 +2241,7 @@ void App::key(int code, bool repeat) {
         if (!repeat) navigate((GetKeyState(VK_SHIFT) & 0x8000) != 0);
         return;
     }
-    if (code == VK_ESCAPE && panel != Panel::Main) { click(ClosePanel); return; }
+    if (code == VK_ESCAPE && panel != Panel::Main) { click(Home); focused = Home; return; }
     if (panel == Panel::Preferences && focused >= PreferenceBase &&
         focused < PreferenceBase + static_cast<int>(preferencePages.size()) && (code == VK_LEFT || code == VK_RIGHT)) {
         const int count = static_cast<int>(preferencePages.size());
@@ -2110,11 +2280,13 @@ void App::key(int code, bool repeat) {
 }
 
 void App::paint() {
-    const bool showLadderCount = panel == Panel::Main && !active && settings.difficulty == Difficulty::Ladder;
-    if (ladderCountEdit && showLadderCount != (IsWindowVisible(ladderCountEdit) != FALSE)) {
-        if (!showLadderCount && GetFocus() == ladderCountEdit) SetFocus(window);
-        ShowWindow(ladderCountEdit, showLadderCount ? SW_SHOWNA : SW_HIDE);
-    }
+    const auto setEditVisible = [&](HWND edit, bool show) {
+        if (!edit || show == (IsWindowVisible(edit) != FALSE)) return;
+        if (!show && GetFocus() == edit) SetFocus(window);
+        ShowWindow(edit, show ? SW_SHOWNA : SW_HIDE);
+    };
+    setEditVisible(ladderCountEdit, panel == Panel::Main && !active && settings.difficulty == Difficulty::Ladder);
+    setEditVisible(cacheLimitEdit, panel == Panel::Preferences && preferencePage == PreferencePage::Session);
     PAINTSTRUCT paintInfo {};
     HDC target = BeginPaint(window, &paintInfo);
     RECT client {};
@@ -2157,7 +2329,7 @@ LRESULT CALLBACK App::procedure(HWND window, UINT message, WPARAM wParam, LPARAM
 LRESULT App::message(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_SIZE:
-        layoutLadderCountEdit();
+        layoutNumberEdits();
         dirty = true;
         InvalidateRect(window, nullptr, FALSE);
         return 0;
@@ -2167,16 +2339,19 @@ LRESULT App::message(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_PAINT: paint(); return 0;
     case WM_TIMER: poll(); return 0;
     case WM_KEYDOWN: key(static_cast<int>(wParam), (lParam & (1LL << 30)) != 0); return 0;
-    case WM_COMMAND:
-        if (ladderCountEdit && reinterpret_cast<HWND>(lParam) == ladderCountEdit) {
-            if (HIWORD(wParam) == EN_CHANGE) readLadderCount();
-            if (HIWORD(wParam) == EN_SETFOCUS) focused = LadderTrialCount;
-            dirty = true;
-            return 0;
+    case WM_COMMAND: {
+        const auto edit = reinterpret_cast<HWND>(lParam);
+        if (!edit || (edit != ladderCountEdit && edit != cacheLimitEdit)) break;
+        if (HIWORD(wParam) == EN_CHANGE) {
+            if (edit == ladderCountEdit) readLadderCount();
+            else readCacheLimit();
         }
-        break;
+        if (HIWORD(wParam) == EN_SETFOCUS) focused = edit == ladderCountEdit ? LadderTrialCount : CacheLimitEdit;
+        dirty = true;
+        return 0;
+    }
     case WM_CTLCOLOREDIT:
-        if (ladderCountEdit && reinterpret_cast<HWND>(lParam) == ladderCountEdit) {
+        if (lParam && (reinterpret_cast<HWND>(lParam) == ladderCountEdit || reinterpret_cast<HWND>(lParam) == cacheLimitEdit)) {
             const auto dc = reinterpret_cast<HDC>(wParam);
             SetTextColor(dc, colors.textColor);
             SetBkColor(dc, colors.raised);
@@ -2245,6 +2420,7 @@ int App::run(HINSTANCE instance, int show) {
     windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_GOLDEN_EAR));
     windowClass.hIconSm = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_GOLDEN_EAR), IMAGE_ICON,
         GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
+    headerIcon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_GOLDEN_EAR), IMAGE_ICON, 64, 64, 0));
     windowClass.lpszClassName = L"GoldenEarWindow";
     if (!RegisterClassExW(&windowClass)) return 1;
     RECT desktop {};
@@ -2261,14 +2437,18 @@ int App::run(HINSTANCE instance, int show) {
         desktop.left + (workW - outerW) / 2, desktop.top + (workH - outerH) / 2,
         outerW, outerH, nullptr, nullptr, instance, this);
     if (!created) return 1;
-    ladderCountEdit = CreateWindowExW(0, L"EDIT", std::to_wstring(settings.trialsPerLevel).c_str(),
-        WS_CHILD | WS_TABSTOP | ES_CENTER | ES_NUMBER | ES_AUTOHSCROLL, 0, 0, 0, 0, created,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(LadderTrialCount)), instance, nullptr);
-    if (!ladderCountEdit) {
+    const auto numberEdit = [&](int id, std::size_t value) {
+        return CreateWindowExW(0, L"EDIT", std::to_wstring(value).c_str(),
+            WS_CHILD | WS_TABSTOP | ES_CENTER | ES_NUMBER | ES_AUTOHSCROLL, 0, 0, 0, 0, created,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance, nullptr);
+    };
+    ladderCountEdit = numberEdit(LadderTrialCount, settings.trialsPerLevel);
+    cacheLimitEdit = numberEdit(CacheLimitEdit, settings.cacheLimitMiB);
+    if (!ladderCountEdit || !cacheLimitEdit) {
         DestroyWindow(created);
         return 1;
     }
-    layoutLadderCountEdit();
+    layoutNumberEdits();
     updateAppearance();
     SetTimer(created, 1, 33, nullptr);
     ShowWindow(created, show);
@@ -2276,14 +2456,23 @@ int App::run(HINSTANCE instance, int show) {
     MSG msg {};
     int result = 0;
     while ((result = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
-        if (msg.hwnd == ladderCountEdit && msg.message == WM_KEYDOWN) {
+        if ((msg.hwnd == ladderCountEdit || msg.hwnd == cacheLimitEdit) && msg.message == WM_KEYDOWN) {
             const bool repeat = (msg.lParam & (1LL << 30)) != 0;
+            if (msg.wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                SendMessageW(msg.hwnd, EM_SETSEL, 0, -1);
+                continue;
+            }
             if (msg.wParam == VK_TAB) {
                 key(VK_TAB, repeat);
                 continue;
             }
             if (msg.wParam == VK_RETURN) {
-                if (!repeat && panel == Panel::Main && !active) click(Start);
+                if (!repeat) {
+                    if (msg.hwnd == ladderCountEdit && panel == Panel::Main && !active) click(Start);
+                    if (msg.hwnd == cacheLimitEdit && panel == Panel::Preferences && preferencePage == PreferencePage::Session) {
+                        click(ApplyCacheLimit);
+                    }
+                }
                 continue;
             }
         }

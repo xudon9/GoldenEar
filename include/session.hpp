@@ -44,7 +44,7 @@ constexpr unsigned profileMask(Codec codec) {
     return mask;
 }
 
-enum class Mode { Abx, Identify, Preference };
+enum class Mode { Abx, Identify };
 enum class Difficulty { Random, Ladder };
 enum class Advance { Next, Skip, ChangeSong };
 

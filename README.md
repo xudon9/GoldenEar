@@ -1,6 +1,6 @@
 # Golden Ear
 
-Golden Ear is a native Windows application for blind listening tests. Use the bundled lossless recordings or import FLAC or WAV tracks, choose ABX, Identify Hi-Fi or Preference, and compare the source with MP3, AAC, LDAC, aptX HD, or SBC. [Product requirements](PRD.md)
+Golden Ear is a native Windows application for blind listening tests. Use the bundled lossless recordings or import FLAC or WAV tracks, choose ABX or Identify Hi-Fi, and compare the source with MP3, AAC, LDAC, aptX HD, or SBC. [Product requirements](PRD.md)
 
 ## Build and run
 
@@ -23,12 +23,12 @@ The build copies the recordings and their credits to `tracks` and the LDAC licen
 
 1. Start with the bundled recordings or add your own using **Import audio**. In **Repertoire**, clear **Show bundled tracks** to use only your imports. The app saves this choice, your imported paths, and your test settings in `%LOCALAPPDATA%\GoldenEar\settings.txt`. `GOLDEN_EAR_HOME` overrides that directory.
 2. Choose a test type, select **Random** or **Ladder**, pick one **Compression codec**, and enable one or more of its bitrate presets. For Ladder, set **Trials per level** before starting. The default is 12. Ladder moves up after that many answers at each bitrate and finishes after the final answer at the highest enabled bitrate. Only submitted answers count toward the preset.
-3. Start a session. Use the play icon below the waveform to begin and the A, B or X buttons to switch while listening. The curved arrows jump backward or forward five seconds. Submit an answer using the separate A/B answer buttons. **Choose song** opens Repertoire, and **Random song** picks a different track immediately. Before an answer, either action replaces the trial at the same quality. After an answer, it opens the next trial on the new track. **Skip** discards the unanswered trial.
-4. **Back to setup** ends the current test and keeps its results on screen while you choose a new test type. **Finish and restart** starts a fresh session with the same settings and resets the results. To hide the restart action, turn off **Restart after finishing** in **Preferences → Session**. Objective modes show per-profile accuracy and an anytime-valid p-value adjusted across the enabled profiles. Preference mode shows how often you preferred the lossless version.
+3. Start a session on **Home**. Use the play icon below the waveform to begin and the A, B or X buttons to switch while listening. The curved arrows jump backward or forward five seconds. Submit an answer using the separate A/B answer buttons. The sample cards then show the quality of A and B and, in ABX, which side matches X. **Choose song** opens Repertoire, and **Random song** picks a different track immediately. Before an answer, either action replaces the trial at the same quality. After an answer, it opens the next trial on the new track. **Skip** discards the unanswered trial.
+4. **Back to setup** ends the current test and keeps its results on **Home** while you choose a new test type. **Finish and restart** starts a fresh session with the same settings and resets the results. To hide the restart action, turn off **Restart after finishing** in **Preferences → Session**. Results show per-profile accuracy and an anytime-valid p-value adjusted across the enabled profiles.
 
 **Shuffle tracks** in **Preferences → Session** selects a different track for new trials when several are available. Turn it off to keep the current track until you choose another one.
 
-Consecutive trials with the same track, codec, and bitrate reuse the decoded audio in memory. Golden Ear keeps up to 128 MiB of compressed audio for the life of the app, evicting the least recently used entries. Returning to a cached track and preset skips encoding. The next trial’s audio is fetched or encoded in the background while you listen. Use **Preferences → Session → Clear audio cache** to free the memory used by saved conversions.
+Consecutive trials with the same track, codec, and bitrate reuse the decoded audio in memory. Golden Ear caches up to 128 MiB of compressed audio by default, evicting the least recently used entries. Change the limit in **Preferences → Session → Audio cache limit**. Lowering the limit frees space immediately, and setting it to 0 disables caching and background encoding. When caching is enabled, returning to a cached track and preset skips encoding, and the next trial’s audio is fetched or encoded in the background while you listen. **Clear audio cache** frees the memory used by saved conversions.
 
 For a guided comparison, turn on **Practice mode** before starting a session. Each sample shows **Lossless source** or its codec and preset, including X in ABX. Practice results show how many questions you answered at each quality.
 
@@ -53,7 +53,7 @@ Sony’s Best Effort mode can move among LDAC bitrates as the link changes. aptX
 
 Drag across the waveform to select a passage. You can also place the playhead at each boundary and use **Set loop start** and **Set loop end**, while playing or paused. Golden Ear highlights the selected range and repeats it at the same positions for A, B, and X. Use **Clear loop** to resume playback through the whole track. The loop stays selected between trials on the same song and clears when the song changes.
 
-When waveform inspection is allowed, use **View A/B waveforms** to open a resizable detail window. It opens on the whole song or the selected loop section. Use the magnifier buttons or mouse wheel to zoom in and out, **Whole song** to reset the range, or the bottom horizontal scrollbar to navigate the song. In ABX, only A and B are shown before answering. Identify Hi-Fi unlocks the button after the answer.
+When waveform inspection is allowed, use **View A/B waveforms** to open a resizable detail window. It opens on the whole song or the selected loop section. Use the magnifier buttons or mouse wheel to zoom in and out. Drag either waveform or the bottom scrollbar to pan across the song. Use **Whole song** to reset the range. In ABX, the popup shows A and B. Identify Hi-Fi unlocks the button after the answer.
 
 ## Keyboard controls
 
@@ -63,7 +63,9 @@ When waveform inspection is allowed, use **View A/B waveforms** to open a resiza
 | `;` | Toggle A/B |
 | Space | Play or pause. After answering, start playing the next trial |
 | `,` / `.` | Seek backward / forward five seconds |
-| 1 / 2 | Submit A / B |
+| U / I | Submit A / B |
+
+On QWERTY, U and I sit above J and K, so you can submit an answer with the same fingers you use to listen to A and B.
 
 Use **Preferences → Shortcuts** to rebind the keys. Tab moves between controls, Enter activates the focused control, and Space toggles a focused checkbox. Use the arrow keys within a group of radio buttons. Tracks up to 15 minutes are supported. Playback uses shared Windows audio output, and the app shows its stream sample rate during each trial.
 

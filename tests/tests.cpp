@@ -106,9 +106,9 @@ void testSessions() {
     require(counts[0] > 50 && counts[1] > 50 && pairs[0][0] && pairs[0][1] && pairs[1][0] && pairs[1][1],
             "Random profile and source assignments lack coverage");
     require(shuffled.scores[1].correct + shuffled.scores[3].correct == 0, "The MP3 side counted as lossless");
-    Session preference(Mode::Preference, Difficulty::Random, {0}, 1, random);
-    preference.submit(preference.trial.lossless);
-    require(preference.scores[0].correct == 1, "Preference did not record a lossless pick");
+    Session identify(Mode::Identify, Difficulty::Random, {0}, 1, random);
+    identify.submit(identify.trial.lossless);
+    require(identify.scores[0].correct == 1, "Identify Hi-Fi did not score the lossless answer as correct");
 
     constexpr unsigned practiceCount = 2;
     Session practice(Mode::Abx, Difficulty::Ladder, {0, 2}, 1, random, true, true, {}, practiceCount);
@@ -379,6 +379,30 @@ void testEncodedAudioCache() {
     const auto aac = cache.getOrEncode(root, sameRateAac, [] { return EncodedAudioCache::Bytes(4, 'a'); });
     require(aac && aac != fresh && cache.getOrEncode(root, profiles[4], empty) == fresh,
             "AAC and MP3 must use distinct cache entries even at the same sample rate and bitrate");
+
+    EncodedAudioCache resized(12);
+    const auto mostRecent = resized.getOrEncode(root, profiles[0], encode);
+    resized.getOrEncode(root, profiles[1], encode);
+    resized.getOrEncode(root, profiles[2], encode);
+    resized.getOrEncode(root, profiles[0], empty);
+    resized.setByteLimit(4);
+    require(resized.getOrEncode(root, profiles[0], empty) == mostRecent &&
+            !resized.getOrEncode(root, profiles[1], empty) && !resized.getOrEncode(root, profiles[2], empty),
+            "Lowering the budget must immediately evict the least recently used entries");
+
+    resized.setByteLimit(8);
+    const auto extraEntry = resized.getOrEncode(root, profiles[1], encode);
+    require(extraEntry && resized.getOrEncode(root, profiles[1], empty) == extraEntry &&
+            resized.getOrEncode(root, profiles[0], empty) == mostRecent,
+            "Raising the budget must allow more cached audio without replacing existing entries");
+
+    const auto uncached = resized.getOrEncode(other, profiles[0], [&] {
+        resized.setByteLimit(0);
+        return encode();
+    });
+    require(uncached && !resized.getOrEncode(other, profiles[0], empty) &&
+            !resized.getOrEncode(root, profiles[0], empty) && !resized.getOrEncode(root, profiles[1], empty),
+            "Disabling the cache must clear retained entries and let an in-flight encode finish without caching");
 }
 
 void testCodecs() {
@@ -414,7 +438,16 @@ void testCodecs() {
                 "Gapless decode did not preserve the reference length");
         double energy[2] {};
         for (std::size_t side = 0; side < 2; ++side) {
-            for (float sample : pair.samples[side]) {
+            constexpr auto block = PreparedAudio::peakBlockFrames;
+            const auto& samples = pair.samples[side];
+            const std::array ranges {LoopRange {block - 3, 3 * block + 5}, LoopRange {block, block + 1},
+                                     LoopRange {pair.frames() - block - 1, pair.frames()}};
+            for (const auto range : ranges) {
+                const auto [low, high] = std::minmax_element(samples.begin() + 2 * range.start, samples.begin() + 2 * range.end);
+                const auto peak = pair.waveformPeak(static_cast<int>(side), range.start, range.end);
+                require(peak.low == *low && peak.high == *high, "Waveform peaks must match the exact displayed stereo range");
+            }
+            for (float sample : samples) {
                 require(std::abs(sample) <= 0.981f, "Signal clipped or contained non-finite values");
                 energy[side] += static_cast<double>(sample) * sample;
             }

@@ -29,6 +29,7 @@ public:
     // An empty result from the encoder is never cached. The callback runs outside the cache lock.
     Encoded getOrEncode(const std::filesystem::path& track, const Profile& profile, const Encoder& encoder,
                         std::stop_token stop = {});
+    void setByteLimit(std::size_t limit);
     // Current encodes and their waiters may finish without putting their results back in the cache.
     void clear();
 
@@ -50,9 +51,10 @@ private:
 
     static std::optional<Key> makeKey(const std::filesystem::path& track, const Profile& profile);
     void remember(const Key& key, const Encoded& encoded);
+    void trim(std::size_t maxBytes, std::size_t maxEntries);
 
     static constexpr std::size_t entryLimit = 512;
-    const std::size_t byteLimit;
+    std::size_t byteLimit;
     std::size_t cachedBytes = 0;
     std::uint64_t generation = 0;
     std::list<Entry> entries;
