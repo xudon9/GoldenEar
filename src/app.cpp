@@ -69,6 +69,20 @@ bool windowsUsesDarkMode() {
                         L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size) == ERROR_SUCCESS && light == 0;
 }
 
+COLORREF blendColor(COLORREF foreground, COLORREF background, int foregroundPercent) {
+    const auto mix = [foregroundPercent](BYTE front, BYTE back) {
+        return static_cast<BYTE>((static_cast<int>(front) * foregroundPercent + static_cast<int>(back) * (100 - foregroundPercent)) / 100);
+    };
+    return RGB(mix(GetRValue(foreground), GetRValue(background)),
+               mix(GetGValue(foreground), GetGValue(background)),
+               mix(GetBValue(foreground), GetBValue(background)));
+}
+
+COLORREF readableTextColor(COLORREF background) {
+    const auto brightness = 299 * GetRValue(background) + 587 * GetGValue(background) + 114 * GetBValue(background);
+    return brightness >= 150000 ? RGB(20, 20, 20) : RGB(255, 255, 255);
+}
+
 constexpr RECT rect(int x, int y, int w, int h) { return {x, y, x + w, y + h}; }
 
 enum Shortcut { HearA, HearB, HearX, ToggleAB, Play, Back, Forward, AnswerA, AnswerB, KeyCount };
@@ -86,7 +100,7 @@ enum Control {
     PreferenceBase = 30, ModeBase = 40, DifficultyBase = 50, KeyBase = 70,
     ThemeBase = 80, LanguageBase = 90, RemoveBase = 100,
     RestartOnFinishOption = 110, ShuffleTracksOption, BackToSetup, ClearEncodedAudioCache, RandomSong, PickTrackBase = 120,
-    ProfileBase = 140, CodecBase = 160, LadderTrialCount = 170, OpenWaveforms
+    ProfileBase = 140, CodecBase = 160, LadderTrialCount = 170, AccentColorButton, ResetAccentColor, OpenWaveforms
 };
 
 enum class Panel { Main, Library, Preferences };
@@ -227,6 +241,7 @@ struct Settings {
     unsigned enabled = (1U << profiles.size()) - 1;
     LanguageSetting language = LanguageSetting::Auto;
     ThemeSetting theme = ThemeSetting::System;
+    std::optional<COLORREF> accentColor;
     bool includeBundled = true;
     bool practice = false;
     bool restartOnFinish = true;
@@ -250,7 +265,8 @@ struct Settings {
         std::ifstream in(file);
         std::string version;
         if (!(in >> version)) return;
-        const bool hasTrialsPerLevel = version == "GoldenEar8";
+        const bool hasAccent = version == "GoldenEar9";
+        const bool hasTrialsPerLevel = hasAccent || version == "GoldenEar8";
         const bool hasCodecs = hasTrialsPerLevel || version == "GoldenEar7";
         const bool hasSessionOptions = hasCodecs || version == "GoldenEar6";
         const bool hasPractice = hasSessionOptions || version == "GoldenEar5";
@@ -281,6 +297,12 @@ struct Settings {
             int savedTheme = 0;
             if (!(in >> savedTheme)) return;
             if (savedTheme >= 0 && savedTheme <= static_cast<int>(ThemeSetting::Dark)) theme = static_cast<ThemeSetting>(savedTheme);
+        }
+        if (hasAccent) {
+            int savedAccent = 0;
+            unsigned savedAccentColor = 0;
+            if (!(in >> savedAccent >> savedAccentColor)) return;
+            if (savedAccent != 0) accentColor = static_cast<COLORREF>(savedAccentColor);
         }
         if (hasPractice && !(in >> practice)) return;
         if (hasSessionOptions && !(in >> restartOnFinish >> shuffleTracks)) return;
@@ -320,8 +342,9 @@ struct Settings {
         auto temp = file;
         temp += L".new";
         std::ofstream out(temp, std::ios::trunc);
-        out << "GoldenEar8\n" << static_cast<int>(mode) << ' ' << static_cast<int>(difficulty) << ' ' << enabled
-            << ' ' << languageCode(language) << ' ' << includeBundled << ' ' << static_cast<int>(theme) << ' ' << practice
+        out << "GoldenEar9\n" << static_cast<int>(mode) << ' ' << static_cast<int>(difficulty) << ' ' << enabled
+            << ' ' << languageCode(language) << ' ' << includeBundled << ' ' << static_cast<int>(theme)
+            << ' ' << (accentColor ? 1 : 0) << ' ' << static_cast<unsigned>(accentColor.value_or(0)) << ' ' << practice
             << ' ' << restartOnFinish << ' ' << shuffleTracks << ' ' << static_cast<int>(codec) << ' ' << trialsPerLevel << '\n';
         for (int key : keys) out << key << ' ';
         out << '\n';
@@ -527,6 +550,7 @@ private:
     static LRESULT CALLBACK waveformProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     void updateLanguage();
     void updateAppearance();
+    void chooseAccentColor();
     void layoutLadderCountEdit();
     void readLadderCount();
     std::wstring_view t(Text id) const { return locale.get(id); }
@@ -624,6 +648,17 @@ void App::updateAppearance() {
     const bool dark = !highContrast && (settings.theme == ThemeSetting::Dark ||
         (settings.theme == ThemeSetting::System && windowsUsesDarkMode()));
     colors = highContrast ? contrastColors() : dark ? darkColors : lightColors;
+    if (!highContrast && settings.accentColor) {
+        colors.accent = *settings.accentColor;
+        colors.primary = colors.accent;
+        colors.primaryHover = blendColor(colors.accent, RGB(0, 0, 0), 88);
+        colors.primaryText = readableTextColor(colors.primary);
+        colors.selected = blendColor(colors.accent, colors.surface, 16);
+        colors.selectedHover = blendColor(colors.accent, colors.surface, 24);
+        colors.selectedBorder = colors.accent;
+        colors.selectedText = readableTextColor(colors.selected);
+        colors.clipWaveform = blendColor(colors.accent, colors.surface, 52);
+    }
 
     const BOOL darkFrame = dark;
     DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkFrame, sizeof(darkFrame));
@@ -658,6 +693,21 @@ void App::updateLanguage() {
     auto& icons = fonts[static_cast<std::size_t>(Font::Icon)];
     icons = createIconFont(L"Segoe Fluent Icons");
     if (!icons) icons = createIconFont(L"Segoe MDL2 Assets");
+}
+
+void App::chooseAccentColor() {
+    COLORREF customColors[16] {};
+    CHOOSECOLORW chooser {};
+    chooser.lStructSize = sizeof(chooser);
+    chooser.hwndOwner = window;
+    chooser.rgbResult = settings.accentColor.value_or(colors.accent);
+    chooser.lpCustColors = customColors;
+    chooser.Flags = CC_FULLOPEN | CC_RGBINIT;
+    if (!ChooseColorW(&chooser)) return;
+    settings.accentColor = chooser.rgbResult;
+    updateAppearance();
+    save();
+    dirty = true;
 }
 
 App::~App() {
@@ -1512,6 +1562,13 @@ void App::appearance(Canvas& canvas) {
                        static_cast<int>(settings.theme) == i, ThemeBase}, t(themeNames[i]));
     }
     canvas.label(t(Text::AppearanceHelp), rect(66, 348, 648, 28), Font::Body, colors.muted);
+    canvas.label(t(Text::AccentColor), rect(66, 399, 648, 28), Font::Bold);
+    canvas.label(t(Text::AccentColorHelp), rect(66, 429, 648, 24), Font::Small, colors.muted);
+    const auto colorButton = rect(66, 461, 222, 42);
+    button(canvas, AccentColorButton, colorButton, t(Text::ChooseAccentColor), Style::Quiet);
+    canvas.box(rect(colorButton.left + 12, colorButton.top + 9, 24, 24), colors.accent, colors.accent, 5);
+    button(canvas, ResetAccentColor, rect(298, 461, 172, 42), t(Text::ResetAccentColor), Style::Quiet,
+           settings.accentColor.has_value(), Font::Small);
 }
 
 void App::shortcuts(Canvas& canvas) {
@@ -1872,6 +1929,14 @@ void App::click(int id) {
     case BackToSetup: finish(false); break;
     case Retry: prepare(); break;
     case OpenWaveforms: openWaveformWindow(); break;
+    case AccentColorButton: chooseAccentColor(); break;
+    case ResetAccentColor:
+        if (settings.accentColor) {
+            settings.accentColor.reset();
+            updateAppearance();
+            save();
+        }
+        break;
     case Next: case NextAndPlay: case Skip: {
         if (!active || session->complete() || preparation.joinable()) break;
         const bool next = id == Next || id == NextAndPlay;
